@@ -1,0 +1,165 @@
+name: Test Plan Gap Analysis
+
+on:
+  # Fires automatically when a PR closes on any branch in the spec repo
+  pull_request:
+    types: [closed]
+
+  # Also allows manual runs with explicit repo/branch inputs
+  workflow_dispatch:
+    inputs:
+      pr_numbers:
+        description: "Space-separated PR numbers to analyse (e.g. 12681 12657 12615)"
+        required: true
+        type: string
+      spec_repo:
+        description: "Spec repo as owner/repo or GitHub URL"
+        required: false
+        type: string
+      spec_branch:
+        description: "Expected base branch for the spec PRs"
+        required: false
+        type: string
+      docs_repo:
+        description: "Test case repo as owner/repo or GitHub URL"
+        required: false
+        type: string
+      docs_branch:
+        description: "Branch/ref to read from the test case repo"
+        required: false
+        type: string
+      docs_subdir:
+        description: "Repo-relative folder containing the .adoc files"
+        required: false
+        default: "."
+        type: string
+      dry_run:
+        description: "Dry run — write report locally, skip GitHub writes"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  gap-analysis:
+    # For push-triggered runs, only proceed if the PR was actually merged
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out orchestrator repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            anthropic>=0.25 \
+            chromadb>=0.4 \
+            PyGithub>=1.59 \
+            PyYAML>=6.0 \
+            tiktoken>=0.5 \
+            gitpython>=3.1 \
+            sentence-transformers>=2.7
+
+      - name: Restore ChromaDB cache
+        uses: actions/cache@v4
+        with:
+          path: chroma_db
+          key: chroma-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: chroma-${{ runner.os }}-
+
+      - name: Build analysis inputs
+        id: analysis_inputs
+        env:
+          INPUT_SPEC_REPO: ${{ github.event.inputs.spec_repo }}
+          INPUT_SPEC_BRANCH: ${{ github.event.inputs.spec_branch }}
+          INPUT_DOCS_REPO: ${{ github.event.inputs.docs_repo }}
+          INPUT_DOCS_BRANCH: ${{ github.event.inputs.docs_branch }}
+          INPUT_DOCS_SUBDIR: ${{ github.event.inputs.docs_subdir }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DEFAULT_SPEC_REPO: ${{ vars.SPEC_REPO_NAME }}
+          DEFAULT_DOCS_REPO: ${{ vars.DOCS_REPO_NAME }}
+          DEFAULT_DOCS_BRANCH: ${{ vars.DOCS_REPO_BRANCH }}
+          DEFAULT_DOCS_SUBDIR: ${{ vars.DOCS_REPO_SUBDIR }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual run — use the provided list
+            spec_repo="${INPUT_SPEC_REPO:-$DEFAULT_SPEC_REPO}"
+            spec_branch="${INPUT_SPEC_BRANCH}"
+            docs_repo="${INPUT_DOCS_REPO:-$DEFAULT_DOCS_REPO}"
+            docs_branch="${INPUT_DOCS_BRANCH:-$DEFAULT_DOCS_BRANCH}"
+            docs_subdir="${INPUT_DOCS_SUBDIR:-${DEFAULT_DOCS_SUBDIR:-.}}"
+
+            echo "prs=${{ github.event.inputs.pr_numbers }}" >> $GITHUB_OUTPUT
+            echo "dry_run=${INPUT_DRY_RUN}" >> $GITHUB_OUTPUT
+            echo "spec_repo=${spec_repo}" >> $GITHUB_OUTPUT
+            echo "spec_branch=${spec_branch}" >> $GITHUB_OUTPUT
+            echo "docs_repo=${docs_repo}" >> $GITHUB_OUTPUT
+            echo "docs_branch=${docs_branch}" >> $GITHUB_OUTPUT
+            echo "docs_subdir=${docs_subdir}" >> $GITHUB_OUTPUT
+          else
+            # Merge trigger — analyse the PR that just merged
+            echo "prs=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "dry_run=false" >> $GITHUB_OUTPUT
+            echo "spec_repo=${{ github.event.pull_request.base.repo.full_name }}" >> $GITHUB_OUTPUT
+            echo "spec_branch=${{ github.event.pull_request.base.ref }}" >> $GITHUB_OUTPUT
+            echo "docs_repo=${DEFAULT_DOCS_REPO}" >> $GITHUB_OUTPUT
+            echo "docs_branch=${DEFAULT_DOCS_BRANCH}" >> $GITHUB_OUTPUT
+            echo "docs_subdir=${DEFAULT_DOCS_SUBDIR:-.}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run gap analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SPEC_GITHUB_TOKEN: ${{ secrets.SPEC_GITHUB_TOKEN }}
+          DOCS_GITHUB_TOKEN: ${{ secrets.DOCS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHROMA_PERSIST_DIR: chroma_db
+          GAP_REPO_CACHE_DIR: repo_cache
+        run: |
+          PR_ARGS=""
+          for pr in ${{ steps.analysis_inputs.outputs.prs }}; do
+            PR_ARGS="$PR_ARGS $pr"
+          done
+
+          DRY_FLAG=""
+          if [ "${{ steps.analysis_inputs.outputs.dry_run }}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+          fi
+
+          SPEC_BRANCH_ARG=""
+          if [ -n "${{ steps.analysis_inputs.outputs.spec_branch }}" ]; then
+            SPEC_BRANCH_ARG="--spec-branch ${{ steps.analysis_inputs.outputs.spec_branch }}"
+          fi
+
+          DOCS_BRANCH_ARG=""
+          if [ -n "${{ steps.analysis_inputs.outputs.docs_branch }}" ]; then
+            DOCS_BRANCH_ARG="--docs-branch ${{ steps.analysis_inputs.outputs.docs_branch }}"
+          fi
+
+          python gap_analyzer.py \
+            --prs $PR_ARGS \
+            --spec-repo ${{ steps.analysis_inputs.outputs.spec_repo }} \
+            $SPEC_BRANCH_ARG \
+            --docs-repo ${{ steps.analysis_inputs.outputs.docs_repo }} \
+            $DOCS_BRANCH_ARG \
+            --docs-subdir "${{ steps.analysis_inputs.outputs.docs_subdir }}" \
+            $DRY_FLAG
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-report-${{ github.run_number }}
+          path: GAP_REPORT_*.md
+          if-no-files-found: ignore
+          retention-days: 30

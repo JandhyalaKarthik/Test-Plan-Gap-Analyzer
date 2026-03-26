@@ -1,0 +1,74 @@
+# Matter Test Plan Gap Analysis — Workflow Configuration
+# All parameters here override the built-in defaults in gap_analyzer.py.
+# Delete any section you don't need — defaults are sensible out of the box.
+
+retrieval:
+  # Vector results with cosine similarity below this threshold are discarded.
+  # Lower = more results but more noise. Raise to 0.80 if getting irrelevant matches.
+  similarity_threshold: 0.72
+
+  # Maximum number of results to return from the vector search per task.
+  max_vector_candidates: 5
+
+  # A grep hit file must match at least this many search_hint keywords
+  # to be considered a confident Tier 1 result.
+  keyword_min_matches: 2
+
+analysis:
+  # Number of completed gap entries to randomly self-review per run.
+  self_review_sample_size: 3
+
+  # Minimum number of gap entries before self-review kicks in.
+  # Skipped for small runs to save API calls.
+  self_review_min_entries: 8
+
+  # Log a warning if this fraction of entries are HIGH priority.
+  # Suggests the decomposer may be over-prioritising.
+  high_priority_ratio_warning: 0.80
+
+  # Number of times to retry the decomposer if it returns malformed JSON.
+  decomposer_max_retries: 2
+
+llm:
+  # Claude Haiku is used for all LLM calls — available on the free plan.
+  model: "claude-haiku-4-5-20251001"
+
+  # Max tokens for the decomposer response (the task list JSON).
+  # Raise if analysing very large PRs with many distinct changes.
+  decomposer_max_tokens: 4096
+
+  # Max tokens for the per-task gap reasoning response.
+  reasoner_max_tokens: 2048
+
+  # Approximate token limit for the diff sent to the decomposer per PR.
+  # Diffs exceeding this are truncated with a notice.
+  # 8000 tokens ≈ 32,000 characters ≈ most real-world spec PRs.
+  diff_truncation_tokens: 8000
+
+report:
+  # Prefix for the generated Markdown report filename.
+  # Final filename: {prefix}_{pr_numbers}_{YYYYMMDD}.md
+  report_filename_prefix: "GAP_REPORT_PR"
+
+  # Branch in the test case repo where reports are committed.
+  reports_branch: "reports/auto"
+
+  # Post a condensed summary comment on each analysed spec PR.
+  post_github_comment: true
+
+  # Commit the full Markdown report to the reports branch.
+  commit_full_report: true
+
+# Maps cluster/feature areas to GitHub usernames for @-mentions in PR comments.
+# The "default" entry is used when no specific match is found.
+# Keys must match the cluster_area values the decomposer produces.
+cluster_owners:
+  "FabricSync": ["@fabric-sync-team"]
+  "OnOff": ["@lighting-team"]
+  "ColorControl": ["@lighting-team"]
+  "NetworkCommissioning": ["@commissioning-team"]
+  "OperationalCredentials": ["@security-team"]
+  "DeviceAttestation": ["@security-team"]
+  "OccupancySensing": ["@sensors-team"]
+  "Thermostat": ["@hvac-team"]
+  "default": ["@test-plan-maintainers"]
