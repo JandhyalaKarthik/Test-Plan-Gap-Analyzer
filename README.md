@@ -39,7 +39,7 @@ index/
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/your-org/matter-gap-analyzer
+git clone https://github.com/JandhyalaKarthik/matter-gap-analyzer
 cd matter-gap-analyzer
 ```
 
