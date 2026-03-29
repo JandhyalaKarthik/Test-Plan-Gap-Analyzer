@@ -12,10 +12,11 @@ Usage:
     python gap_analyzer.py --pr 12681 --spec-repo org/matter-test-spec --docs-repo https://github.com/your-org/matter-test-cases --docs-branch release/1.6 --docs-subdir src/tests --dry-run
 
 Dependencies:
-    pip install anthropic chromadb tiktoken PyGithub PyYAML gitpython sentence-transformers
+    pip install openai chromadb tiktoken PyGithub PyYAML gitpython sentence-transformers tqdm
 
-LLM: claude-haiku-4-5-20251001 — available on the Claude free plan.
-    All decomposition, gap reasoning, and self-review calls use Haiku.
+LLM: configured via workflow_config.yaml (or GAP_LLM_MODEL override).
+    The same configured model is used for decomposition, gap reasoning,
+    self-review, and vector tag extraction.
 
 Embeddings: nomic-ai/nomic-embed-text-v1.5 via sentence-transformers.
     Runs fully locally — no OpenAI key or cost required.
@@ -29,6 +30,7 @@ import os
 import random
 import re
 import hashlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,9 +41,10 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-import anthropic
+from openai import OpenAI, RateLimitError as LLMRateLimitError, APIError as LLMAPIError
 import yaml
-from github import Github, GithubException
+from github import Auth, Github, GithubException
+from tqdm.auto import tqdm
 
 # vector_index.py must be on the path (lives alongside this file)
 from vector_index import VectorIndex, should_index_file
@@ -63,6 +66,15 @@ VALID_TERM_STATES   = {"gap_identified", "already_covered", "no_existing_coverag
 GITHUB_REPO_RE      = re.compile(
     r"^(?:https?://github\.com/|git@github\.com:)?(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$"
 )
+WORD_RE             = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}")
+STOPWORDS           = {
+    "the", "and", "for", "with", "from", "that", "this", "into", "onto", "when",
+    "where", "what", "which", "while", "have", "has", "had", "were", "been", "being",
+    "are", "was", "not", "but", "all", "any", "per", "its", "their", "your", "our",
+    "after", "before", "under", "over", "through", "change", "changes", "update",
+    "updated", "fix", "fixed", "draft", "local", "spec", "specification", "protocol",
+    "matter", "pull", "request", "cluster", "attribute", "test", "plan", "plans",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +87,7 @@ def load_config(path: str = "workflow_config.yaml") -> dict:
         "retrieval":  {"similarity_threshold": 0.72, "max_vector_candidates": 5, "keyword_min_matches": 2},
         "analysis":   {"self_review_sample_size": 3, "self_review_min_entries": 8,
                        "high_priority_ratio_warning": 0.80, "decomposer_max_retries": 2},
-        "llm":        {"model": "claude-haiku-4-5-20251001", "decomposer_max_tokens": 4096,
+        "llm":        {"model": "meta-llama/llama-3.3-70b-instruct:free", "decomposer_max_tokens": 4096,
                        "reasoner_max_tokens": 2048, "diff_truncation_tokens": 8000},
         "report":     {"report_filename_prefix": "GAP_REPORT_PR", "reports_branch": "reports/auto",
                        "post_github_comment": True, "commit_full_report": True},
@@ -94,7 +106,32 @@ def load_config(path: str = "workflow_config.yaml") -> dict:
                 defaults[section] = values
     except FileNotFoundError:
         logger.warning("workflow_config.yaml not found — using defaults.")
+
+    env_model = os.environ.get("GAP_LLM_MODEL", "").strip()
+    if env_model:
+        defaults["llm"]["model"] = env_model
     return defaults
+
+
+def resolve_openrouter_api_key(explicit_key: Optional[str] = None) -> str:
+    """Resolves the OpenRouter API key from CLI arg or environment."""
+    token = (explicit_key or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not token:
+        raise RuntimeError(
+            "Missing OpenRouter API key. Pass --openrouter-api-key or set OPENROUTER_API_KEY."
+        )
+    return token
+
+
+def progress_bar(iterable, *, total: Optional[int] = None, desc: str, unit: str):
+    """Shared tqdm configuration for long-running orchestration phases."""
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        unit=unit,
+        dynamic_ncols=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +186,7 @@ class GapEntry:
     action_required:  str
     priority:         str              # HIGH | MEDIUM | LOW
     source_file:      Optional[str]
+    source_section:   Optional[str]
     match_confidence: str
     review_flag:      bool
     terminal_state:   str              # gap_identified|already_covered|no_existing_coverage|analysis_failed
@@ -381,24 +419,37 @@ def prepare_repo(
     cache_root = Path(clone_root).expanduser()
     cache_root.mkdir(parents=True, exist_ok=True)
     temp_dir = tempfile.TemporaryDirectory(prefix=f"{label}_repo_", dir=cache_root)
-    repo_root = Path(temp_dir.name)
+    temp_root = Path(temp_dir.name)
+    repo_root = temp_root / "repo"
     docs_token = get_docs_github_token(required=False) if label == "docs" else ""
 
-    clone_cmd = ["git", "clone", "--depth", "1", "--single-branch"]
+    clone_cmd_prefix = ["git", "clone", "--depth", "1", "--single-branch"]
     if branch:
-        clone_cmd.extend(["--branch", branch])
-    clone_cmd.extend([make_authed_clone_url(repo_name, docs_token), str(repo_root)])
+        clone_cmd_prefix.extend(["--branch", branch])
 
-    try:
-        subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
+    clone_urls: list[str] = []
+    if docs_token:
+        clone_urls.append(make_authed_clone_url(repo_name, docs_token))
+    clone_urls.append(make_authed_clone_url(repo_name))
+
+    clone_errors: list[str] = []
+    for clone_url in dict.fromkeys(clone_urls):
+        shutil.rmtree(repo_root, ignore_errors=True)
+        clone_cmd = [*clone_cmd_prefix, clone_url, str(repo_root)]
+        try:
+            subprocess.run(clone_cmd, check=True, capture_output=True, text=True)
+            break
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip() or "unknown git clone error"
+            clone_errors.append(stderr)
+    else:
         temp_dir.cleanup()
-        stderr = (exc.stderr or "").strip() or "unknown git clone error"
+        error_detail = clone_errors[-1] if clone_errors else "unknown git clone error"
         raise RuntimeError(
             f"Failed to clone {label} repo '{repo_name}'"
             + (f" at branch '{branch}'" if branch else "")
-            + f": {stderr}"
-        ) from exc
+            + f": {error_detail}"
+        )
 
     content_root = resolve_repo_content_root(repo_root, normalized_subdir)
     effective_branch = branch or detect_checked_out_branch(repo_root)
@@ -521,8 +572,14 @@ def build_header_map(docs_repo_local_path: str) -> dict:
 
     headers: list[dict] = []
     root = Path(docs_repo_local_path)
+    adoc_paths = sorted(root.rglob("*.adoc"))
 
-    for adoc_path in root.rglob("*.adoc"):
+    for adoc_path in progress_bar(
+        adoc_paths,
+        total=len(adoc_paths),
+        desc="Building header map",
+        unit="file",
+    ):
         rel = str(adoc_path.relative_to(root))
         try:
             raw = adoc_path.read_text(encoding="utf-8", errors="replace")
@@ -616,6 +673,216 @@ def fetch_pr_packet(
     }
 
 
+def extract_changed_files(diff: str) -> list[str]:
+    """Parses synthetic diff headers emitted by fetch_pr_packet()."""
+    files: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("--- ") and " (" in line:
+            files.append(line[4:].split(" (", 1)[0].strip())
+    return files
+
+
+def summarize_text(text: str, limit: int = 220) -> str:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3].rstrip() + "..."
+
+
+def humanize_identifier(value: str) -> str:
+    text = re.sub(r"[_\-]+", " ", value).strip()
+    if not text:
+        return "Unknown"
+    return " ".join(part.capitalize() for part in text.split())
+
+
+def derive_cluster_area(packet: dict, changed_files: list[str]) -> str:
+    """Best-effort area name for heuristic fallback when the LLM is unavailable."""
+    if changed_files:
+        first = Path(changed_files[0])
+        meaningful_dirs = [
+            part for part in first.parts[:-1]
+            if part.lower() not in {"src", "docs", "doc", "spec", "specs", "clusters", "cluster"}
+        ]
+        if meaningful_dirs:
+            return humanize_identifier(meaningful_dirs[-1])
+        if first.stem:
+            return humanize_identifier(first.stem)
+
+    title = packet.get("pr_title", "")
+    for match in re.finditer(r"\b([A-Z][A-Za-z0-9]+)\b", title):
+        token = match.group(1)
+        if token.lower() not in STOPWORDS:
+            return token
+    return "Unknown"
+
+
+def extract_search_hints(packet: dict, changed_files: list[str], cluster_area: str) -> list[str]:
+    """Pulls a few search terms from the title, description, and changed filenames."""
+    candidates: list[str] = []
+
+    if cluster_area and cluster_area != "Unknown":
+        candidates.extend(re.findall(r"[A-Za-z0-9]+", cluster_area))
+
+    for path in changed_files[:3]:
+        p = Path(path)
+        for token in (p.stem, p.parent.name):
+            if token:
+                candidates.extend(re.split(r"[_\-.]+", token))
+
+    source_text = " ".join([
+        packet.get("pr_title", ""),
+        packet.get("pr_description", ""),
+        " ".join(packet.get("commit_messages", [])),
+    ])
+    candidates.extend(WORD_RE.findall(source_text))
+
+    hints: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        token = raw.strip().lower()
+        if len(token) < 3 or token in STOPWORDS or token.isdigit():
+            continue
+        if token not in seen:
+            seen.add(token)
+            hints.append(token)
+        if len(hints) >= 5:
+            break
+
+    return hints or ["spec_change"]
+
+
+def heuristic_decompose_pr(packet: dict) -> list[Task]:
+    """
+    Conservative decomposition fallback used when the LLM is unavailable.
+
+    Produces a small number of low-confidence tasks so the rest of the pipeline
+    can still retrieve potentially relevant test cases and generate a report.
+    """
+    changed_files = extract_changed_files(packet.get("diff", ""))
+    title = packet.get("pr_title", "")
+    description = packet.get("pr_description", "")
+    cluster_area = derive_cluster_area(packet, changed_files)
+    search_hints = extract_search_hints(packet, changed_files, cluster_area)
+
+    editorial_markers = ("anchor", "xref", "link", "format", "spelling", "typo")
+    create_markers = ("new", "add", "introduce", "initial draft", "first draft")
+    update_markers = ("update", "errata", "fix", "correct", "conformance", "attestation")
+    combined_text = f"{title} {description}".lower()
+
+    if any(marker in combined_text for marker in editorial_markers):
+        task_type = "no_action"
+        priority = "LOW"
+    elif any(marker in combined_text for marker in create_markers):
+        task_type = "create"
+        priority = "MEDIUM"
+    elif any(marker in combined_text for marker in update_markers):
+        task_type = "update"
+        priority = "MEDIUM"
+    else:
+        task_type = "audit"
+        priority = "MEDIUM"
+
+    if task_type == "no_action":
+        logger.info(
+            "Heuristic fallback classified PR #%s as no_action.",
+            packet.get("pr_number"),
+        )
+        return []
+
+    if re.search(r"\b(attestation|commission|security|authentication|credential)\b", combined_text):
+        priority = "HIGH"
+
+    summary_parts = [summarize_text(title)]
+    if description.strip():
+        summary_parts.append(summarize_text(description))
+    if changed_files:
+        summary_parts.append(f"Changed files: {', '.join(changed_files[:3])}")
+
+    action_required = (
+        "Heuristic fallback used because the LLM provider was unavailable. "
+        "Manually review relevant test plans in the selected docs subtree and update or add coverage as needed."
+    )
+    if task_type == "create":
+        action_required = (
+            "Heuristic fallback suggests new or expanded coverage may be needed. "
+            "Review the selected docs subtree and author or extend test cases for this behavior."
+        )
+    elif task_type == "update":
+        action_required = (
+            "Heuristic fallback suggests existing coverage may need updates. "
+            "Review the selected docs subtree and revise matching test steps, PICS, or expected outcomes."
+        )
+
+    return [Task(
+        task_id="heuristic_task_001",
+        type=task_type,
+        cluster_area=cluster_area,
+        tc_id=None,
+        target_description=f"Review {cluster_area} coverage for PR #{packet['pr_number']}.",
+        search_hints=search_hints,
+        spec_change_summary=" | ".join(part for part in summary_parts if part),
+        action_required=action_required,
+        priority=priority,
+        confidence="low",
+        review_flag=True,
+    )]
+
+
+def heuristic_reason_about_gap(task: Task, retrieval: RetrievalResult) -> dict:
+    """
+    Conservative reasoning fallback when the LLM is unavailable.
+
+    Never claims "already_covered". It only points to likely relevant existing
+    coverage or to missing coverage that needs human confirmation.
+    """
+    if retrieval.candidates:
+        best = retrieval.candidates[0]
+        search_space = " ".join([
+            best.file_path,
+            best.resolved_header_text,
+            best.raw_text[:1200],
+        ]).lower()
+        overlaps = [hint for hint in task.search_hints if hint.lower() in search_space]
+        overlap_summary = ", ".join(overlaps[:3]) if overlaps else "semantic retrieval only"
+
+        return {
+            "coverage_verdict": "partial_gap",
+            "match_confidence": "low",
+            "gap_details": (
+                "Heuristic fallback was used because the LLM provider was unavailable. "
+                f"Potentially relevant existing coverage was found in {best.file_path} "
+                f"under '{best.resolved_header_text}' (matched: {overlap_summary}). "
+                "Manual review is required before treating this as fully covered."
+            ),
+            "affected_tcs": [best.tc_id] if best.tc_id else [],
+            "action_type": "update" if task.type in {"update", "create"} else "audit",
+            "action_required": (
+                f"Review {best.file_path}"
+                + (f" ({best.tc_id})" if best.tc_id else "")
+                + " and update or extend it to reflect the spec PR."
+            ),
+            "priority": task.priority,
+        }
+
+    coverage_verdict = "new_tc_needed" if task.type == "create" else "full_gap"
+    action_type = "create" if task.type == "create" else "audit"
+    return {
+        "coverage_verdict": coverage_verdict,
+        "match_confidence": "low",
+        "gap_details": (
+            "Heuristic fallback was used because the LLM provider was unavailable. "
+            "No relevant indexed coverage was found in the selected docs subtree."
+        ),
+        "affected_tcs": [],
+        "action_type": action_type,
+        "action_required": (
+            "Review a broader docs subtree or author new coverage if this spec change is test-impacting."
+        ),
+        "priority": task.priority,
+    }
+
+
 
 # ---------------------------------------------------------------------------
 # Phase 2 — Task decomposition
@@ -660,26 +927,26 @@ Diff:
 """
 
 
-def call_claude_json(
-    client: anthropic.Anthropic,
+def call_llm_json(
+    client: OpenAI,
     prompt: str,
     model: str,
     max_tokens: int,
     retries: int = 2,
 ) -> list | dict:
     """
-    Calls Claude and parses the response as JSON.
+    Calls the LLM via OpenRouter and parses the response as JSON.
     Strips markdown fences defensively. Retries on parse failure.
     """
     last_error = None
     for attempt in range(retries + 1):
         try:
-            resp = client.messages.create(
+            resp = client.chat.completions.create(
                 model      = model,
                 max_tokens = max_tokens,
                 messages   = [{"role": "user", "content": prompt}],
             )
-            raw  = resp.content[0].text.strip()
+            raw  = resp.choices[0].message.content.strip()
             # Strip ```json ... ``` fences if present
             raw  = re.sub(r"^```(?:json)?\s*", "", raw)
             raw  = re.sub(r"\s*```$", "", raw)
@@ -689,16 +956,17 @@ def call_claude_json(
             logger.warning("JSON parse failed (attempt %d/%d): %s", attempt + 1, retries + 1, e)
             if attempt < retries:
                 time.sleep(2 ** attempt)
-        except anthropic.RateLimitError:
+        except LLMRateLimitError:
+            last_error = RuntimeError("Rate limited by configured LLM provider.")
             wait = 2 ** (attempt + 2)
             logger.warning("Rate limited — waiting %ds.", wait)
             time.sleep(wait)
-        except anthropic.APIError as e:
+        except LLMAPIError as e:
             last_error = e
             logger.warning("API error (attempt %d/%d): %s", attempt + 1, retries + 1, e)
             if attempt < retries:
                 time.sleep(2 ** attempt)
-    raise RuntimeError(f"Claude call failed after {retries + 1} attempts: {last_error}")
+    raise RuntimeError(f"LLM call failed after {retries + 1} attempts: {last_error}")
 
 
 TASK_REQUIRED_FIELDS = {
@@ -709,7 +977,7 @@ AREA_FIELD_ALIASES = ("cluster_area", "feature_area", "component_area", "domain_
 
 
 def decompose_pr(packet: dict, config: dict,
-                 client: anthropic.Anthropic) -> list[Task]:
+                 client: OpenAI) -> list[Task]:
     """
     Phase 2: calls the decomposer LLM and returns a validated list of Tasks.
     """
@@ -721,10 +989,18 @@ def decompose_pr(packet: dict, config: dict,
         diff           = packet["diff"],
     )
 
-    raw_tasks: list[dict] = call_claude_json(
-        client, prompt, cfg["model"], cfg["decomposer_max_tokens"],
-        retries=config["analysis"]["decomposer_max_retries"],
-    )
+    try:
+        raw_tasks: list[dict] = call_llm_json(
+            client, prompt, cfg["model"], cfg["decomposer_max_tokens"],
+            retries=config["analysis"]["decomposer_max_retries"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "LLM decomposition unavailable for PR #%s — using heuristic fallback: %s",
+            packet.get("pr_number"),
+            exc,
+        )
+        return heuristic_decompose_pr(packet)
 
     tasks: list[Task] = []
     no_action_log: list[dict] = []
@@ -1037,10 +1313,10 @@ def reason_about_gap(
     task: Task,
     retrieval: RetrievalResult,
     config: dict,
-    client: anthropic.Anthropic,
+    client: OpenAI,
 ) -> dict:
     """
-    Phase 3b: calls Claude to analyse the coverage gap.
+    Phase 3b: calls the configured LLM to analyse the coverage gap.
     Returns the parsed JSON reasoning output.
 
     Handles three retrieval outcomes:
@@ -1072,7 +1348,15 @@ def reason_about_gap(
             raw_text             = best.raw_text[:2000],
         )
 
-    return call_claude_json(client, prompt, cfg["model"], cfg["reasoner_max_tokens"])
+    try:
+        return call_llm_json(client, prompt, cfg["model"], cfg["reasoner_max_tokens"])
+    except Exception as exc:
+        logger.warning(
+            "LLM gap reasoning unavailable for task %s — using heuristic fallback: %s",
+            task.task_id,
+            exc,
+        )
+        return heuristic_reason_about_gap(task, retrieval)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1391,7 @@ def assemble_gap_entry(
     review_flag = task.review_flag or (match_confidence == "low")
 
     source_file = retrieval.candidates[0].file_path if retrieval.candidates else None
+    source_section = retrieval.candidates[0].resolved_header_text if retrieval.candidates else None
 
     return GapEntry(
         gap_id          = gap_id,
@@ -1121,6 +1406,7 @@ def assemble_gap_entry(
         action_required = reasoning.get("action_required", task.action_required),
         priority        = reasoning.get("priority", task.priority),
         source_file     = source_file,
+        source_section  = source_section,
         match_confidence= match_confidence,
         review_flag     = review_flag,
         terminal_state  = terminal_state,
@@ -1189,7 +1475,7 @@ def self_review_sample(
     gap_entries: dict[str, GapEntry],
     retrieval_map: dict[str, RetrievalResult],
     config: dict,
-    client: anthropic.Anthropic,
+    client: OpenAI,
 ) -> None:
     """5c: LLM self-review on a random sample. Mutates review_flag in place."""
     cfg              = config["analysis"]
@@ -1208,7 +1494,12 @@ def self_review_sample(
     sample = random.sample(actionable, min(sample_size, len(actionable)))
     logger.info("Self-reviewing %d sampled gap entries...", len(sample))
 
-    for entry in sample:
+    for entry in progress_bar(
+        sample,
+        total=len(sample),
+        desc="Self-reviewing entries",
+        unit="entry",
+    ):
         retrieval   = retrieval_map.get(entry.task_id)
         raw_excerpt = ""
         if retrieval and retrieval.candidates:
@@ -1219,7 +1510,7 @@ def self_review_sample(
             raw_text       = raw_excerpt,
         )
         try:
-            result = call_claude_json(client, prompt, llm_cfg["model"], 512, retries=1)
+            result = call_llm_json(client, prompt, llm_cfg["model"], 512, retries=1)
             failed_checks = [k for k in ("accurate", "specific", "priority_correct")
                              if not result.get(k, True)]
             if failed_checks:
@@ -1282,6 +1573,43 @@ def _action_cell(entry: GapEntry) -> str:
     return cell
 
 
+def recommendation_label(entry: GapEntry) -> str:
+    """Human-readable action category for reports/comments."""
+    if entry.terminal_state == "already_covered":
+        return "Already Covered"
+    if entry.terminal_state == "analysis_failed":
+        return "Manual Review Needed"
+    if entry.terminal_state == "no_existing_coverage":
+        return "Current Test Case Docs Do Not Cover This PR"
+    if entry.action_type == "update":
+        return "Update Existing Test Case"
+    if entry.action_type == "create":
+        return "Create New Sub-Test Case" if entry.source_file else "Create New Test Case"
+    if entry.action_type == "verify":
+        return "Verify Recommendation"
+    return "Review Existing Coverage"
+
+
+def location_hint(entry: GapEntry, summary: dict) -> str:
+    """Where the user should look or add coverage."""
+    if entry.source_file and entry.source_section:
+        return f"`{entry.source_file}` → `{entry.source_section}`"
+    if entry.source_file:
+        return f"`{entry.source_file}`"
+    docs_subdir = summary.get("docs_subdir", ".")
+    return f"No matching file found under selected docs subtree `{docs_subdir}`"
+
+
+def detail_hint(entry: GapEntry) -> str:
+    """Detailed gap explanation with a safe fallback."""
+    detail = (entry.gap_details or "").strip()
+    if detail:
+        return detail
+    if entry.terminal_state == "no_existing_coverage":
+        return "No relevant indexed test-case coverage was found for this PR in the selected docs subtree."
+    return "No additional analysis detail was captured."
+
+
 def render_markdown_report(
     gap_entries: dict[str, GapEntry],
     summary: dict,
@@ -1342,7 +1670,7 @@ def render_markdown_report(
     lines += [
         "## PR-by-PR Gap Analysis",
         "",
-        "| **PR #** | **Cluster / Area** | **Spec Change** | **Affected TCs** | **Action Required** |",
+        "| **PR #** | **Cluster / Area** | **Recommendation** | **Where To Update / Add** | **Affected TCs** |",
         "| --- | --- | --- | --- | --- |",
     ]
 
@@ -1351,9 +1679,9 @@ def render_markdown_report(
         affected = ", ".join(entry.affected_tcs) if entry.affected_tcs else "None (new)"
         lines.append(
             f"| **{entry.source_pr}** | **{entry.cluster_area}** "
-            f"| {entry.spec_change} "
+            f"| **{recommendation_label(entry)}** "
+            f"| {location_hint(entry, summary)} "
             f"| {affected} "
-            f"| {_action_cell(entry)} |"
         )
 
     # Priority-sorted action summary
@@ -1375,8 +1703,30 @@ def render_markdown_report(
         lines.append(
             f"| **{entry.priority}{verify_tag}** "
             f"| **{entry.cluster_area}** "
-            f"| {entry.action_required} |"
+            f"| **{recommendation_label(entry)}**<br>{entry.action_required} |"
         )
+
+    lines += [
+        "",
+        "---",
+        "",
+        "## Detailed Recommendations",
+        "",
+    ]
+    for entry in sorted_entries:
+        lines += [
+            f"### {entry.source_pr} — {entry.cluster_area}",
+            "",
+            f"- Recommendation: **{recommendation_label(entry)}**",
+            f"- Priority: **{entry.priority}**" + (" ⚠️ Verify" if entry.review_flag else ""),
+            f"- Coverage Verdict: `{entry.coverage_verdict}`",
+            f"- Where To Update / Add: {location_hint(entry, summary)}",
+            f"- Affected TCs: {', '.join(entry.affected_tcs) if entry.affected_tcs else 'None identified'}",
+            f"- Spec Change: {entry.spec_change}",
+            f"- Gap Details: {detail_hint(entry)}",
+            f"- Action Required: {entry.action_required}",
+            "",
+        ]
 
     # Already-covered section
     covered = [e for e in gap_entries.values() if e.terminal_state == "already_covered"]
@@ -1401,6 +1751,7 @@ def render_github_comment(
     summary: dict,
     packet: dict,
     report_url: Optional[str],
+    local_report_path: Optional[str] = None,
     filter_pr: Optional[int] = None,
 ) -> str:
     """
@@ -1422,7 +1773,15 @@ def render_github_comment(
     )
 
     rows = "\n".join(
-        f"| **{e.priority}{'⚠️' if e.review_flag else ''}** | **{e.cluster_area}** | {e.action_required} |"
+        f"| **{e.priority}{'⚠️' if e.review_flag else ''}** | **{e.cluster_area}** | **{recommendation_label(e)}** | {location_hint(e, summary)} |"
+        for e in sorted_entries
+    )
+
+    detail_rows = "\n".join(
+        f"- **{e.cluster_area}** — {recommendation_label(e)}<br>"
+        f"Where: {location_hint(e, summary)}<br>"
+        f"Details: {detail_hint(e)}<br>"
+        f"Action: {e.action_required}"
         for e in sorted_entries
     )
 
@@ -1434,7 +1793,12 @@ def render_github_comment(
     this_new_tcs = sum(max(len(e.affected_tcs), 1) for e in actionable if e.action_type == "create")
     this_updates = len({e.cluster_area for e in actionable if e.action_type != "create"})
 
-    report_link  = f"[Full Report]({report_url})" if report_url else "_Report not committed (dry-run)_"
+    if report_url:
+        report_link = f"[Full Report]({report_url})"
+    elif local_report_path:
+        report_link = f"`{local_report_path}`"
+    else:
+        report_link = "_Report not committed_"
 
     return (
         f"## 🔍 Test Plan Gap Analysis — Auto-Generated\n\n"
@@ -1449,9 +1813,11 @@ def render_github_comment(
         f"| {this_updates} "
         f"| {this_verify} |\n\n"
         f"### Action Summary\n\n"
-        f"| Priority | Cluster | Action |\n"
-        f"| --- | --- | --- |\n"
+        f"| Priority | Cluster | Recommendation | Where |\n"
+        f"| --- | --- | --- | --- |\n"
         f"{rows}\n\n"
+        f"### Details\n\n"
+        f"{detail_rows}\n\n"
         f"---\n"
         f"*{this_verify} entries marked ⚠️ Verify — confirm before acting.*  \n"
         f"*{this_covered} spec changes already covered — no action needed.*"
@@ -1478,6 +1844,7 @@ def commit_report_to_branch(
     reports_dir = repo_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / filename
+    relative_report_path = report_path.relative_to(repo_path)
 
     try:
         # Ensure we're on the reports branch (create if necessary)
@@ -1487,7 +1854,7 @@ def commit_report_to_branch(
         )
         report_path.write_text(report_md, encoding="utf-8")
         subprocess.run(
-            ["git", "-C", str(repo_path), "add", str(report_path)],
+            ["git", "-C", str(repo_path), "add", str(relative_report_path)],
             check=True, capture_output=True, text=True,
         )
         commit_result = subprocess.run(
@@ -1507,7 +1874,7 @@ def commit_report_to_branch(
                 check=True, capture_output=True, text=True,
             )
         logger.info("Report committed to branch '%s': reports/%s", branch, filename)
-        return f"reports/{filename}"
+        return str(relative_report_path)
     except subprocess.CalledProcessError as e:
         logger.warning("Failed to commit report: %s", e.stderr)
         return None
@@ -1527,6 +1894,7 @@ def run_batch(
     docs_branch: Optional[str] = None,
     docs_subdir: str = ".",
     repo_cache_dir: str = "./repo_cache",
+    openrouter_api_key: Optional[str] = None,
 ) -> dict:
     """
     Runs the full gap analysis pipeline across multiple PRs and produces a
@@ -1540,8 +1908,13 @@ def run_batch(
     """
     spec_token = get_spec_github_token()
     docs_token = get_docs_github_token(required=False)
-    gh = Github(spec_token)
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    llm_model = config["llm"]["model"]
+    gh = Github(auth=Auth.Token(spec_token))
+    client = OpenAI(
+        api_key     = resolve_openrouter_api_key(openrouter_api_key),
+        base_url    = "https://openrouter.ai/api/v1",
+        max_retries = 0,
+    )
     spec_repo_name = normalize_spec_repo_name(spec_repo_input)
     docs_repo = prepare_repo(
         repo_input=docs_repo_input,
@@ -1556,7 +1929,8 @@ def run_batch(
         scope_id = repo_scope_id(docs_repo)
         index = VectorIndex(
             persist_directory=persist_dir,
-            anthropic_client=client,
+            llm_client=client,
+            llm_model=llm_model,
             collection_name=f"matter_test_cases_{scope_id}",
         )
 
@@ -1566,6 +1940,7 @@ def run_batch(
             docs_repo.branch,
             docs_repo.subdir,
         )
+        logger.info("Using configured LLM model '%s' for all LLM-backed analysis.", llm_model)
         sync_vector_index(index, docs_repo.content_root, persist_dir, scope_id)
 
         # Build header map once — shared across all PRs
@@ -1579,7 +1954,12 @@ def run_batch(
         all_packets: list[dict] = []
         skipped_prs: list[int] = []
 
-        for pr_number in pr_numbers:
+        for pr_number in progress_bar(
+            pr_numbers,
+            total=len(pr_numbers),
+            desc="Fetching and decomposing PRs",
+            unit="pr",
+        ):
             logger.info("=== Fetching PR #%d ===", pr_number)
             try:
                 packet = fetch_pr_packet(
@@ -1622,7 +2002,15 @@ def run_batch(
         retrieval_map: dict[str, RetrievalResult] = {}
         partial_warning: Optional[str] = None
 
-        for i, task in enumerate(all_tasks, 1):
+        for i, task in enumerate(
+            progress_bar(
+                all_tasks,
+                total=len(all_tasks),
+                desc="Analyzing tasks",
+                unit="task",
+            ),
+            1,
+        ):
             # Extract the original PR number from the prefixed task_id
             pr_num_for_task = int(task.task_id.split("_")[0].lstrip("pr"))
             logger.info("[%d/%d] %s — %s (%s)", i, len(all_tasks),
@@ -1651,7 +2039,7 @@ def run_batch(
                     coverage_verdict="full_gap", gap_details=f"Analysis failed: {e}",
                     action_type="audit",
                     action_required="Manual review required — automated analysis failed.",
-                    priority=task.priority, source_file=None, match_confidence="low",
+                    priority=task.priority, source_file=None, source_section=None, match_confidence="low",
                     review_flag=True, terminal_state="analysis_failed",
                 )
 
@@ -1704,6 +2092,7 @@ def run_batch(
         branch = config["report"]["reports_branch"]
 
         report_url: Optional[str] = None
+        local_report_path: Optional[str] = None
         if not dry_run and config["report"]["commit_full_report"]:
             push_target = None
             if docs_repo.repo_name and docs_token:
@@ -1717,21 +2106,33 @@ def run_batch(
                 report_url = (
                     f"https://github.com/{docs_repo.repo_name}/blob/{branch}/{committed_path}"
                 )
+            else:
+                out_path = Path(filename).resolve()
+                out_path.write_text(report_md, encoding="utf-8")
+                local_report_path = str(out_path)
+                logger.info("Report commit failed; report written locally to %s", out_path)
         else:
             out_path = Path(filename)
             out_path.write_text(report_md, encoding="utf-8")
+            local_report_path = str(out_path.resolve())
             logger.info("Dry-run: report written locally to %s", out_path)
 
         # Post a comment on each analyzed PR
         if not dry_run and config["report"]["post_github_comment"]:
             spec_repo_obj = gh.get_repo(spec_repo_name)
-            for packet in all_packets:
+            for packet in progress_bar(
+                all_packets,
+                total=len(all_packets),
+                desc="Posting PR comments",
+                unit="pr",
+            ):
                 pr_num = packet["pr_number"]
                 comment_body = render_github_comment(
                     gap_entries,
                     summary,
                     packet,
                     report_url,
+                    local_report_path=local_report_path,
                     filter_pr=pr_num,
                 )
                 try:
@@ -1748,6 +2149,8 @@ def run_batch(
             len(all_packets), summary["gaps_identified"], summary["new_tcs_needed"],
             summary["entries_flagged_for_verify"], summary["already_covered"],
         )
+        if local_report_path:
+            summary["local_report_path"] = local_report_path
         return summary
     finally:
         docs_repo.cleanup()
@@ -1767,6 +2170,7 @@ def run(
     docs_branch: Optional[str] = None,
     docs_subdir: str = ".",
     repo_cache_dir: str = "./repo_cache",
+    openrouter_api_key: Optional[str] = None,
 ) -> dict:
     """
     Single-PR convenience wrapper — delegates to run_batch().
@@ -1781,6 +2185,7 @@ def run(
         docs_branch = docs_branch,
         docs_subdir = docs_subdir,
         repo_cache_dir = repo_cache_dir,
+        openrouter_api_key = openrouter_api_key,
     )
 
 
@@ -1803,7 +2208,7 @@ if __name__ == "__main__":
         epilog="""
 Examples:
   # Single PR
-  python gap_analyzer.py --pr 12681 --spec-repo org/matter-test-spec --docs-repo https://github.com/your-org/matter-test-cases
+  python gap_analyzer.py --pr 12681 --spec-repo org/matter-test-spec --docs-repo https://github.com/your-org/matter-test-cases --openrouter-api-key sk-or-v1-...
 
   # Multiple PRs — one combined report, one comment per PR
   python gap_analyzer.py --prs 12681 12657 12615 --spec-repo org/matter-test-spec --docs-repo org/matter-test-cases
@@ -1812,12 +2217,12 @@ Examples:
   python gap_analyzer.py --prs 12681 12657 --spec-repo https://github.com/your-org/matter-test-spec --spec-branch release/1.6 --docs-repo https://github.com/your-org/matter-test-cases --docs-branch release/1.6 --docs-subdir src/tests --dry-run
 
 Required environment variables:
-  ANTHROPIC_API_KEY   (Claude Haiku — free plan works)
   CHROMA_PERSIST_DIR  (e.g. "./chroma_db")
 
 No OpenAI key needed — embeddings run locally via sentence-transformers.
 
 Optional:
+  OPENROUTER_API_KEY                 (used if --openrouter-api-key is not passed)
   SPEC_GITHUB_TOKEN                 (spec repo read/comment; falls back to GITHUB_TOKEN)
   DOCS_GITHUB_TOKEN                 (docs repo clone/push; falls back to GITHUB_TOKEN)
   GITHUB_TOKEN                      (single-token fallback for both)
@@ -1871,6 +2276,11 @@ Optional:
         default=os.environ.get("GAP_REPO_CACHE_DIR", "./repo_cache"),
         help="Local directory used for temporary remote repo clones",
     )
+    parser.add_argument(
+        "--openrouter-api-key",
+        default=None,
+        help="OpenRouter API key. If omitted, OPENROUTER_API_KEY is used.",
+    )
     parser.add_argument("--config",      default="workflow_config.yaml")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Skip GitHub comment + report commit; write report locally only")
@@ -1890,6 +2300,7 @@ Optional:
             docs_branch = args.docs_branch,
             docs_subdir = args.docs_subdir,
             repo_cache_dir = args.repo_cache_dir,
+            openrouter_api_key = args.openrouter_api_key,
         )
         print(json.dumps(result, indent=2))
     except Exception as exc:

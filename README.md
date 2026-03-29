@@ -1,6 +1,6 @@
 # Matter Test Plan Gap Analyzer
 
-Automatically analyses spec PRs and identifies which test cases in the test case repository need to be created or updated. Produces a structured Markdown report and posts a summary comment on each spec PR.
+Automatically analyses spec PRs and identifies which test cases in the test case repository need to be created or updated. Produces a structured Markdown report, posts a summary comment on each spec PR, and shows progress bars during long-running phases.
 
 ---
 
@@ -13,9 +13,17 @@ The system operates across two completely separate repositories:
 | **Spec repo** | GitHub API (read-only) | PR diff, title, description, commit messages. The `.adoc` spec files are never opened. |
 | **Test case repo** | Local path or GitHub repo URL | The analyzer materializes the selected branch locally, then reads, chunks, and indexes the `.adoc` files under the requested subfolder. |
 
-For each input PR, Claude Haiku decomposes the diff into a list of spec changes that may require test case work. For each change, the system searches the test case repo by keyword grep and vector similarity, then reasons about whether existing test cases cover the change. The result is a prioritised gap report.
+For each input PR, the single OpenRouter model configured in `workflow_config.yaml` (or overridden by the workflow input) decomposes the diff into a list of spec changes that may require test case work. For each change, the system searches the test case repo by keyword grep and vector similarity, then reasons about whether existing test cases cover the change. The result is a prioritised gap report.
 
 No test case files are modified. The system is purely analytical.
+
+### Model flow, briefly
+
+- One LLM only: `llm.model` in `workflow_config.yaml` is the single model used for decomposition, gap reasoning, self-review, and vector tag extraction.
+- The model reads GitHub PR metadata and diff content from the spec repo. It does not open spec files directly from disk.
+- Test case retrieval is hybrid: keyword grep plus vector search over locally generated embeddings in ChromaDB. The embeddings are local and do not call an LLM.
+- After retrieval, the same configured model decides whether the PR implies updating an existing test case, creating new coverage, or marking the result for manual review.
+- If the LLM is rate-limited, the tool falls back to heuristics so the run can still finish with a conservative recommendation.
 
 ---
 
@@ -70,13 +78,14 @@ If you were expecting a spec-side starting directory flag, that is not part of t
 
 ```bash
 pip install \
-  anthropic>=0.25 \
+  openai>=1.0 \
   chromadb>=0.4 \
   PyGithub>=1.59 \
   PyYAML>=6.0 \
   tiktoken>=0.5 \
   gitpython>=3.1 \
-  sentence-transformers>=2.7
+  sentence-transformers>=2.7 \
+  tqdm>=4.66
 ```
 
 The embedding model (`nomic-ai/nomic-embed-text-v1.5`, ~274 MB) downloads automatically from HuggingFace on first run and is cached locally. No OpenAI key is needed.
@@ -84,7 +93,7 @@ The embedding model (`nomic-ai/nomic-embed-text-v1.5`, ~274 MB) downloads automa
 ### 4. Set environment variables
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."        # Claude Haiku — free plan works
+export OPENROUTER_API_KEY="sk-or-v1-..."    # Used if you do not pass --openrouter-api-key
 export SPEC_GITHUB_TOKEN="ghp_spec_..."     # Read spec repo PRs + post PR comments
 export DOCS_GITHUB_TOKEN="ghp_docs_..."     # Clone/pull/push the private test case repo
 # optional single-token fallback if one token can access both:
@@ -94,6 +103,16 @@ export DOCS_REPO_BRANCH="main"              # optional
 export DOCS_REPO_SUBDIR="."                 # optional
 export CHROMA_PERSIST_DIR="./chroma_db"
 export GAP_REPO_CACHE_DIR="./repo_cache"    # optional temp clone location
+```
+
+Or pass the OpenRouter key directly on the command line:
+
+```bash
+python gap_analyzer.py \
+  --pr 12681 \
+  --spec-repo your-org/matter-test-spec \
+  --docs-repo https://github.com/your-org/matter-test-cases \
+  --openrouter-api-key "sk-or-v1-..."
 ```
 
 ### 4a. Private repo credentials
@@ -118,7 +137,8 @@ python gap_analyzer.py \
   --pr 12681 \
   --spec-repo https://github.com/your-org/private-spec-repo \
   --docs-repo https://github.com/other-org/private-test-repo \
-  --docs-subdir .
+  --docs-subdir . \
+  --openrouter-api-key "sk-or-v1-..."
 ```
 
 ### 5. Optional: prebuild or inspect the vector index
@@ -126,10 +146,10 @@ python gap_analyzer.py \
 `gap_analyzer.py` now builds or incrementally updates the correct vector index automatically for the selected docs repo, branch, and subfolder. You only need `vector_index.py` if you want to inspect chunking or prebuild from a local checkout.
 
 ```bash
-python vector_index.py ./matter-test-cases
+python vector_index.py ./matter-test-cases --openrouter-api-key "sk-or-v1-..."
 ```
 
-Takes 2–10 minutes depending on how many test case files exist. Progress is logged. Subsequent runs use the cached index.
+Takes 2–10 minutes depending on how many test case files exist. Slow phases now show `tqdm` progress bars, and subsequent runs use the cached index.
 
 ---
 
@@ -141,7 +161,8 @@ Takes 2–10 minutes depending on how many test case files exist. Progress is lo
 python gap_analyzer.py \
   --pr 12681 \
   --spec-repo your-org/matter-test-spec \
-  --docs-repo https://github.com/your-org/matter-test-cases
+  --docs-repo https://github.com/your-org/matter-test-cases \
+  --openrouter-api-key "sk-or-v1-..."
 ```
 
 ### Analyse a single PR with both repo locations spelled out
@@ -189,6 +210,7 @@ python gap_analyzer.py \
 | `--docs-branch BRANCH` | Branch/ref to read from a remote test case repo |
 | `--docs-subdir path/inside/repo` | Repo-relative folder that contains the `.adoc` files |
 | `--repo-cache-dir ./repo_cache` | Temp clone directory for remote repos |
+| `--openrouter-api-key KEY` | OpenRouter API key to use instead of the `OPENROUTER_API_KEY` environment variable |
 | `--config path.yaml` | Config file path (default: `workflow_config.yaml`) |
 | `--dry-run` | Write report locally, skip GitHub comment and report commit |
 
@@ -241,10 +263,11 @@ Configure these in the repo's Settings → Secrets and variables:
 
 | Name | Type | Value |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Secret | Your Anthropic API key |
+| `OPENROUTER_API_KEY` | Secret | OpenRouter API key used when the workflow passes `--openrouter-api-key` |
 | `SPEC_GITHUB_TOKEN` | Secret | Optional PAT/App token for private spec repo read/comment access |
 | `DOCS_GITHUB_TOKEN` | Secret | Optional PAT/App token for private docs repo clone/push access |
 | `GITHUB_TOKEN` | Automatic | Shared fallback if one token can access both repos |
+| `GAP_LLM_MODEL` | Variable | Optional workflow-level override for the single LLM model used everywhere |
 | `DOCS_REPO_NAME` | Variable | Optional default docs repo, e.g. `your-org/matter-test-cases` |
 | `DOCS_REPO_BRANCH` | Variable | Optional default docs branch, e.g. `main` |
 | `DOCS_REPO_SUBDIR` | Variable | Optional default docs subfolder, e.g. `src/tests` |
@@ -297,7 +320,7 @@ retrieval:
   keyword_min_matches: 2       # Raise if keyword search is too permissive
 
 llm:
-  model: "claude-haiku-4-5-20251001"   # Free plan model
+  model: "meta-llama/llama-3.3-70b-instruct:free"  # Single model used for all LLM-backed phases
   diff_truncation_tokens: 8000         # Raise for very large PRs
 
 cluster_owners:
@@ -306,6 +329,8 @@ cluster_owners:
 ```
 
 See `workflow_config.yaml` for the full list with descriptions.
+
+If you manually dispatch the GitHub Action, the optional `llm_model` workflow input overrides this value for that run and is still applied consistently across decomposition, gap reasoning, self-review, and vector tag extraction.
 
 ---
 
@@ -335,6 +360,37 @@ Entries marked ⚠️ Verify had low retrieval confidence or failed the automate
 
 ## Troubleshooting
 
+**Broken venv or compiled-module import errors**  
+If your local environment is corrupted, or you hit NumPy / Torch / sentence-transformers binary issues, rebuild the venv from scratch with a known-good set:
+
+Step 1. Delete the broken venv:
+```bash
+deactivate || true
+rm -rf venv311
+```
+
+Step 2. Recreate a clean Python 3.11 environment:
+```bash
+python3.11 -m venv venv311
+source venv311/bin/activate
+pip install --upgrade pip
+```
+
+Step 3. Install compatible versions:
+```bash
+pip install "numpy<2"
+pip install "torch==2.4.0" "torchvision==0.19.0" "torchaudio==2.4.0"
+pip install "sentence-transformers==2.7.0"
+pip install "chromadb>=0.4"
+pip install "openai>=1.0" "PyGithub>=1.59" "PyYAML>=6.0" "tiktoken>=0.5" "gitpython>=3.1" "tqdm>=4.66"
+```
+
+Why this works:
+
+- `numpy<2` avoids common compiled-extension crashes in older dependency stacks.
+- `torch==2.4.0` with matching `torchvision` and `torchaudio` gives a stable base for `sentence-transformers==2.7.0`.
+- Rebuilding the venv cleanly avoids partial resolver state and broken binary leftovers.
+
 **"No chunks produced" during indexing**  
 The test case files may use a non-standard structure. Run `--inspect` on a specific file to see how it's being chunked:
 ```bash
@@ -348,8 +404,8 @@ The vector search may be matching the wrong sections. Lower `similarity_threshol
 **Decomposer returns empty task list**  
 The PR diff may be too large and got truncated to nothing meaningful, or the PR is purely editorial (comments, whitespace). Check the log output. Raise `diff_truncation_tokens` if needed.
 
-**Rate limiting from Claude API**  
-The free plan has per-minute rate limits. For large batches of PRs (10+), runs may slow down due to backoff. Consider adding a small `time.sleep(1)` between tasks in `run_batch` if hitting limits frequently, or upgrade to a paid plan.
+**Rate limiting from OpenRouter**  
+Free-tier models can hit per-minute or per-day rate limits. For large batches of PRs, runs may slow down due to backoff or fall back to heuristic analysis. If this happens often, switch the configured model in `workflow_config.yaml` or the workflow input to a model with better quota for your account.
 
 **Embedding model download fails**  
 The first run downloads `nomic-ai/nomic-embed-text-v1.5` (~274 MB) from HuggingFace. If you're in an air-gapped environment, pre-download with:
@@ -357,3 +413,23 @@ The first run downloads `nomic-ai/nomic-embed-text-v1.5` (~274 MB) from HuggingF
 python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)"
 ```
 Then copy the HuggingFace cache to the target environment.
+
+---
+
+## Reverting Changes
+
+Before these updates, a backup snapshot was saved under `revert_backups/<date>/`.
+
+To restore the tracked project files from a backup snapshot:
+
+```bash
+./revert_from_backup.sh revert_backups/20260329
+```
+
+That restores:
+
+- `gap_analyzer.py`
+- `vector_index.py`
+- `workflow_config.yaml`
+- `gap_analysis.yml`
+- `README.md`

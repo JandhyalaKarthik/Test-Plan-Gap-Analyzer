@@ -33,6 +33,10 @@ on:
         required: false
         default: "."
         type: string
+      llm_model:
+        description: "Optional OpenRouter model override for all LLM-backed analysis"
+        required: false
+        type: string
       dry_run:
         description: "Dry run — write report locally, skip GitHub writes"
         required: false
@@ -62,13 +66,14 @@ jobs:
       - name: Install dependencies
         run: |
           pip install \
-            anthropic>=0.25 \
+            openai>=1.0 \
             chromadb>=0.4 \
             PyGithub>=1.59 \
             PyYAML>=6.0 \
             tiktoken>=0.5 \
             gitpython>=3.1 \
-            sentence-transformers>=2.7
+            sentence-transformers>=2.7 \
+            tqdm>=4.66
 
       - name: Restore ChromaDB cache
         uses: actions/cache@v4
@@ -85,11 +90,13 @@ jobs:
           INPUT_DOCS_REPO: ${{ github.event.inputs.docs_repo }}
           INPUT_DOCS_BRANCH: ${{ github.event.inputs.docs_branch }}
           INPUT_DOCS_SUBDIR: ${{ github.event.inputs.docs_subdir }}
+          INPUT_LLM_MODEL: ${{ github.event.inputs.llm_model }}
           INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
           DEFAULT_SPEC_REPO: ${{ vars.SPEC_REPO_NAME }}
           DEFAULT_DOCS_REPO: ${{ vars.DOCS_REPO_NAME }}
           DEFAULT_DOCS_BRANCH: ${{ vars.DOCS_REPO_BRANCH }}
           DEFAULT_DOCS_SUBDIR: ${{ vars.DOCS_REPO_SUBDIR }}
+          DEFAULT_LLM_MODEL: ${{ vars.GAP_LLM_MODEL }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Manual run — use the provided list
@@ -98,6 +105,7 @@ jobs:
             docs_repo="${INPUT_DOCS_REPO:-$DEFAULT_DOCS_REPO}"
             docs_branch="${INPUT_DOCS_BRANCH:-$DEFAULT_DOCS_BRANCH}"
             docs_subdir="${INPUT_DOCS_SUBDIR:-${DEFAULT_DOCS_SUBDIR:-.}}"
+            llm_model="${INPUT_LLM_MODEL:-$DEFAULT_LLM_MODEL}"
 
             echo "prs=${{ github.event.inputs.pr_numbers }}" >> $GITHUB_OUTPUT
             echo "dry_run=${INPUT_DRY_RUN}" >> $GITHUB_OUTPUT
@@ -106,6 +114,7 @@ jobs:
             echo "docs_repo=${docs_repo}" >> $GITHUB_OUTPUT
             echo "docs_branch=${docs_branch}" >> $GITHUB_OUTPUT
             echo "docs_subdir=${docs_subdir}" >> $GITHUB_OUTPUT
+            echo "llm_model=${llm_model}" >> $GITHUB_OUTPUT
           else
             # Merge trigger — analyse the PR that just merged
             echo "prs=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
@@ -115,16 +124,17 @@ jobs:
             echo "docs_repo=${DEFAULT_DOCS_REPO}" >> $GITHUB_OUTPUT
             echo "docs_branch=${DEFAULT_DOCS_BRANCH}" >> $GITHUB_OUTPUT
             echo "docs_subdir=${DEFAULT_DOCS_SUBDIR:-.}" >> $GITHUB_OUTPUT
+            echo "llm_model=${DEFAULT_LLM_MODEL}" >> $GITHUB_OUTPUT
           fi
 
       - name: Run gap analysis
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SPEC_GITHUB_TOKEN: ${{ secrets.SPEC_GITHUB_TOKEN }}
           DOCS_GITHUB_TOKEN: ${{ secrets.DOCS_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHROMA_PERSIST_DIR: chroma_db
           GAP_REPO_CACHE_DIR: repo_cache
+          GAP_LLM_MODEL: ${{ steps.analysis_inputs.outputs.llm_model }}
         run: |
           PR_ARGS=""
           for pr in ${{ steps.analysis_inputs.outputs.prs }}; do
@@ -153,6 +163,7 @@ jobs:
             --docs-repo ${{ steps.analysis_inputs.outputs.docs_repo }} \
             $DOCS_BRANCH_ARG \
             --docs-subdir "${{ steps.analysis_inputs.outputs.docs_subdir }}" \
+            --openrouter-api-key "${{ secrets.OPENROUTER_API_KEY }}" \
             $DRY_FLAG
 
       - name: Upload report as artifact

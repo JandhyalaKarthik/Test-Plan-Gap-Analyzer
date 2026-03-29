@@ -30,8 +30,11 @@ analysis:
   decomposer_max_retries: 2
 
 llm:
-  # Claude Haiku is used for all LLM calls — available on the free plan.
-  model: "claude-haiku-4-5-20251001"
+  # Single OpenRouter model used for all LLM-backed work in this project:
+  # decomposition, gap reasoning, self-review, and vector tag extraction.
+  # Free variants are identified by the :free suffix on OpenRouter.
+  # The workflow can override this at runtime by setting GAP_LLM_MODEL.
+  model: "meta-llama/llama-3.3-70b-instruct:free"
 
   # Max tokens for the decomposer response (the task list JSON).
   # Raise if analysing very large PRs with many distinct changes.

@@ -16,7 +16,7 @@ Key design decisions reflected here:
     header map (Phase 0 — 2a) at execution time.
 
 Dependencies:
-    pip install chromadb anthropic tiktoken sentence-transformers
+    pip install chromadb openai PyYAML tiktoken sentence-transformers tqdm
 
 Embedding model: nomic-ai/nomic-embed-text-v1.5 (runs fully locally via
 sentence-transformers — no API key or cost). The model uses task-prefix
@@ -24,7 +24,8 @@ notation: documents are prefixed with "search_document:" at index time,
 queries are prefixed with "search_query:" at search time, as required by
 the nomic model for asymmetric retrieval quality.
 
-LLM: claude-haiku-4-5-20251001 — available on the Claude free plan.
+LLM: configured via workflow_config.yaml (or GAP_LLM_MODEL override) and used
+for all OpenRouter-backed tagging calls.
 """
 
 from __future__ import annotations
@@ -32,16 +33,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-import anthropic
+from openai import OpenAI, APIError as LLMAPIError
 import chromadb
 import tiktoken
+import yaml
 from sentence_transformers import SentenceTransformer
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +59,8 @@ EMBEDDING_MODEL       = "nomic-ai/nomic-embed-text-v1.5"
 #   queries   → "search_query: <text>"
 EMBED_DOC_PREFIX      = "search_document: "
 EMBED_QUERY_PREFIX    = "search_query: "
-TAG_MODEL             = "claude-haiku-4-5-20251001"  # free plan + fast for short tag lists
 CHROMA_COLLECTION     = "matter_test_cases"
+DEFAULT_LLM_MODEL     = "meta-llama/llama-3.3-70b-instruct:free"
 ADOC_HEADER_PATTERN   = re.compile(r"^(=+)\s+(.+)$", re.MULTILINE)
 ADOC_ATTR_DEF_PATTERN = re.compile(r"^:(\w[\w-]*):\s*(.*)$", re.MULTILINE)
 # Matches resolved TC-IDs like TC-MCORE.FS-1.1 or TC-CC-1.3
@@ -94,6 +98,50 @@ _CONTENT_INCLUDE_PATTERN = re.compile(
     r"^:picsCode:|===== Test Procedure|===== Purpose|Test Case List|PICS Definition",
     re.MULTILINE,
 )
+
+
+def progress_bar(iterable, *, total: Optional[int] = None, desc: str, unit: str):
+    """Shared tqdm configuration for long-running phases."""
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        unit=unit,
+        dynamic_ncols=True,
+    )
+
+
+def load_llm_model_from_config(config_path: str = "workflow_config.yaml") -> str:
+    """
+    Returns the configured LLM model for all OpenRouter-backed calls.
+
+    Precedence:
+      1. GAP_LLM_MODEL env var (used by workflow overrides)
+      2. llm.model in workflow_config.yaml
+      3. built-in default
+    """
+    env_model = os.environ.get("GAP_LLM_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        model = (((data.get("llm") or {}).get("model")) or "").strip()
+        if model:
+            return model
+    except FileNotFoundError:
+        pass
+
+    return DEFAULT_LLM_MODEL
+
+
+def resolve_openrouter_api_key(explicit_key: Optional[str] = None) -> str:
+    """Resolves the OpenRouter API key from CLI arg or environment."""
+    token = (explicit_key or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not token:
+        raise RuntimeError("Missing OpenRouter API key. Pass --openrouter-api-key or set OPENROUTER_API_KEY.")
+    return token
 
 
 def should_index_file(file_path: str, raw_content: str) -> tuple[bool, str]:
@@ -137,6 +185,22 @@ class FileType(Enum):
     UNKNOWN   = "unknown"     # Cannot determine — chunk conservatively
 
 
+def detect_test_case_header_level(raw_content: str) -> Optional[int]:
+    """
+    Returns the preferred test-case chunk header level for a file.
+
+    Normal test plans use level 4 (`====`) for one-header-per-test-case.
+    Some shared include-style templates only use level 5 (`=====`) sections
+    like Purpose / Required Devices / Test Procedure. Prefer level 4 when both
+    are present so complete test cases stay intact.
+    """
+    if re.search(r"^====\s+", raw_content, re.MULTILINE):
+        return 4
+    if re.search(r"^=====\s+", raw_content, re.MULTILINE):
+        return 5
+    return None
+
+
 def detect_file_type(raw_content: str) -> FileType:
     """
     Inspects raw .adoc content to decide how it should be chunked.
@@ -156,30 +220,38 @@ def detect_file_type(raw_content: str) -> FileType:
     has_pics_code      = bool(re.search(r"^:picsCode:", raw_content, re.MULTILINE))
     has_test_procedure = bool(re.search(r"^={4,5}\s+(?:Test Procedure|Purpose|Preconditions)", raw_content, re.MULTILINE))
     has_test_case_list = bool(re.search(r"Test Case List|PICS Definition", raw_content))
-    has_level4_headers = bool(re.search(r"^====\s+", raw_content, re.MULTILINE))
+    test_case_header_level = detect_test_case_header_level(raw_content)
+    has_test_case_headers = test_case_header_level is not None
     has_include        = bool(re.search(r"^include::", raw_content, re.MULTILINE))
     has_spec_anchors   = bool(re.search(r"\[\[ref_", raw_content))
 
-    if has_pics_code or (has_test_procedure and has_test_case_list):
+    if has_pics_code or (has_test_procedure and (has_test_case_list or has_test_case_headers)):
         return FileType.TEST_CASE
 
-    if (has_include or has_spec_anchors) and not has_level4_headers:
+    if (has_include or has_spec_anchors) and not has_test_case_headers:
         return FileType.SPEC
 
-    if has_level4_headers:
+    if has_test_case_headers:
         return FileType.TEST_CASE
 
     return FileType.UNKNOWN
 
 
-def chunk_level_for(file_type: FileType) -> int:
+def chunk_level_for(file_type: FileType, raw_content: Optional[str] = None) -> int:
     """
     Returns the header level (number of = signs) at which chunk boundaries are placed.
 
-    TEST_CASE → 4  (==== is one complete test case, e.g. [TC-MCORE.FS-1.1] FS Setup)
+    TEST_CASE → 4 or 5
+      4 = normal test-case files where each ==== header is one test case
+      5 = include-style templates that only expose ===== sections
     SPEC      → 2  (== is a major spec section, e.g. == Certificate Common Conventions)
     UNKNOWN   → 3  (conservative middle ground)
     """
+    if file_type == FileType.TEST_CASE and raw_content is not None:
+        header_level = detect_test_case_header_level(raw_content)
+        if header_level is not None:
+            return header_level
+
     return {
         FileType.TEST_CASE: 4,
         FileType.SPEC:      2,
@@ -248,7 +320,7 @@ class Chunk:
     No line_start / line_end — see workflow doc Section 2b.
     Line numbers are always resolved live from the header map at execution time.
     """
-    chunk_id:             str            # "{filename}::{raw_header_text}" — stable across edits
+    chunk_id:             str            # "{file_path}::{header_start}::{raw_header_text}[::{piece_index}]"
     file_path:            str            # Relative path inside the docs repo
     raw_header_text:      str            # Literal header text (for header map join)
     resolved_header_text: str            # Attribute-substituted header text (for search/display)
@@ -315,12 +387,23 @@ def _split_on_paragraphs(text: str, max_tokens: int, enc: tiktoken.Encoding) -> 
     return pieces
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Best-effort detection for provider 429 / rate-limit responses."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+
+    message = str(exc).lower()
+    return "rate limit" in message or "429" in message
+
+
 def chunk_adoc_file(raw_content: str, file_path: str) -> list[Chunk]:
     """
     Splits a single .adoc file into Chunk objects.
 
     Step 1 — Detect file type and choose chunk level.
-        Test case files (has :picsCode:, ==== headers) -> chunk at level 4.
+        Test case files typically chunk at level 4 (====), but include-style
+        templates that only use ===== sections chunk at level 5.
         Spec files (include:: directives, [[ref_...]] anchors) -> chunk at level 2.
         Unknown -> chunk at level 3.
 
@@ -340,11 +423,10 @@ def chunk_adoc_file(raw_content: str, file_path: str) -> list[Chunk]:
 
     Step 5 — Handle oversized sections.
         Sections above MAX_CHUNK_TOKENS are split on paragraph boundaries.
-        Each sub-chunk gets a content-hash suffix on its chunk_id so it can be
+        Each sub-chunk gets a numeric suffix on its chunk_id so it can be
         individually deleted and reinserted during incremental updates.
     """
     enc = tiktoken.get_encoding("cl100k_base")
-    filename = Path(file_path).name
 
     # Gate: skip non-test-case files (licensing, summaries, READMEs, etc.)
     should_index, skip_reason = should_index_file(file_path, raw_content)
@@ -354,7 +436,7 @@ def chunk_adoc_file(raw_content: str, file_path: str) -> list[Chunk]:
 
     # Step 1 — file type and chunk level
     file_type   = detect_file_type(raw_content)
-    chunk_level = chunk_level_for(file_type)
+    chunk_level = chunk_level_for(file_type, raw_content)
     logger.debug("%s -> file_type=%s, chunk_level=%d", file_path, file_type.value, chunk_level)
 
     # Step 2 — attribute resolution
@@ -406,9 +488,10 @@ def chunk_adoc_file(raw_content: str, file_path: str) -> list[Chunk]:
         tc_match = TC_ID_PATTERN.search(resolved_header_text)
         tc_id    = tc_match.group(0) if tc_match else None
 
-        # chunk_id is keyed on raw_header_text — stable even if :picsCode: changes,
-        # because raw_header_text still contains the unresolved {picsCode} literal.
-        chunk_id = f"{filename}::{raw_header_text}"
+        # chunk_id includes the repo-relative file path and raw header start
+        # offset, which avoids collisions for repeated headers like
+        # "Attributes" and for same-named files under different directories.
+        chunk_id = f"{file_path}::{start}::{raw_header_text}"
 
         if _count_tokens(section_text, enc) <= MAX_CHUNK_TOKENS:
             chunks.append(Chunk(
@@ -430,10 +513,9 @@ def chunk_adoc_file(raw_content: str, file_path: str) -> list[Chunk]:
                 "Section '%s' in %s exceeded max tokens — split into %d pieces.",
                 raw_header_text, file_path, len(pieces),
             )
-            for piece in pieces:
-                piece_hash = hashlib.sha1(piece.encode()).hexdigest()[:8]
+            for piece_idx, piece in enumerate(pieces, start=1):
                 chunks.append(Chunk(
-                    chunk_id             = f"{chunk_id}::{piece_hash}",
+                    chunk_id             = f"{chunk_id}::{piece_idx}",
                     file_path            = file_path,
                     raw_header_text      = raw_header_text,
                     resolved_header_text = resolved_header_text,
@@ -458,7 +540,7 @@ def chunk_adoc_file(raw_content: str, file_path: str) -> list[Chunk]:
 # Cluster tag extraction (LLM)
 # ---------------------------------------------------------------------------
 
-def extract_cluster_tags(chunks: list[Chunk], anthropic_client: anthropic.Anthropic) -> None:
+def extract_cluster_tags(chunks: list[Chunk], llm_client: OpenAI, llm_model: str) -> None:
     """
     Enriches each Chunk's cluster_tags in-place via batched LLM calls.
 
@@ -469,7 +551,12 @@ def extract_cluster_tags(chunks: list[Chunk], anthropic_client: anthropic.Anthro
     Failures are soft: a failed batch leaves cluster_tags as [], so retrieval
     still works, just without tag-based filtering for those chunks.
     """
-    for batch_start in range(0, len(chunks), TAG_BATCH_SIZE):
+    for batch_start in progress_bar(
+        range(0, len(chunks), TAG_BATCH_SIZE),
+        total=(len(chunks) + TAG_BATCH_SIZE - 1) // TAG_BATCH_SIZE,
+        desc="Tagging chunks",
+        unit="batch",
+    ):
         batch = chunks[batch_start : batch_start + TAG_BATCH_SIZE]
 
         sections_text = "\n\n".join(
@@ -497,12 +584,27 @@ Sections:
 {sections_text}"""
 
         try:
-            response = anthropic_client.messages.create(
-                model    = TAG_MODEL,
+            response = llm_client.chat.completions.create(
+                model      = llm_model,
                 max_tokens = 512,
-                messages = [{"role": "user", "content": prompt}],
+                messages   = [{"role": "user", "content": prompt}],
             )
-            raw = response.content[0].text.strip()
+            content = response.choices[0].message.content
+            if content is None:
+                # OpenRouter returns content=None when the free-tier model is
+                # unavailable or the request is rate-limited/filtered.
+                # finish_reason will typically be "error" or "content_filter".
+                finish_reason = response.choices[0].finish_reason
+                logger.warning(
+                    "Tag extraction got empty content at batch %d (finish_reason=%s) — skipping.",
+                    batch_start, finish_reason,
+                )
+                continue
+            raw = content.strip()
+            # Strip markdown fences defensively
+            import re as _re
+            raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = _re.sub(r"\s*```$", "", raw)
             tag_lists: list[list[str]] = json.loads(raw)
 
             if len(tag_lists) != len(batch):
@@ -515,7 +617,14 @@ Sections:
             for chunk, tags in zip(batch, tag_lists):
                 chunk.cluster_tags = [str(t).lower() for t in tags if isinstance(t, str)]
 
-        except (json.JSONDecodeError, IndexError, anthropic.APIError) as exc:
+        except (json.JSONDecodeError, IndexError, LLMAPIError) as exc:
+            if _is_rate_limit_error(exc):
+                logger.warning(
+                    "Tag extraction disabled for the rest of this run after rate limit at batch %d: %s",
+                    batch_start,
+                    exc,
+                )
+                return
             logger.warning("Tag extraction failed for batch at index %d: %s", batch_start, exc)
             # cluster_tags remains [] — retrieval still works without tag filtering
 
@@ -553,6 +662,64 @@ def _get_embedding_model() -> SentenceTransformer:
 # Embedding
 # ---------------------------------------------------------------------------
 
+def _initial_embed_batch_size() -> int:
+    """
+    Returns a starting batch size tuned for the current device.
+
+    On Apple Silicon (MPS) the self-attention layer allocates
+    O(batch × seq_len²) memory. nomic-embed-text-v1.5 supports up to
+    2048 tokens, so even batch=4 can exceed available unified memory when
+    chunks are long. We start small and let _embed_batch() halve on OOM.
+    """
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return 4
+    except Exception:
+        pass
+    return EMBED_BATCH_SIZE
+
+
+def _embed_batch(
+    model,
+    texts: list[str],
+    batch_size: int,
+    batch_start: int,
+) -> list[list[float]]:
+    """
+    Embeds a list of texts, halving batch_size on MPS OOM until batch_size=1.
+    Raises RuntimeError if even batch_size=1 fails.
+    """
+    while batch_size >= 1:
+        try:
+            vecs = model.encode(
+                texts,
+                batch_size           = batch_size,
+                show_progress_bar    = False,
+                normalize_embeddings = True,
+            )
+            return vecs.tolist()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower() and batch_size > 1:
+                new_size = max(1, batch_size // 2)
+                logger.warning(
+                    "MPS OOM at batch_start=%d batch_size=%d — retrying with batch_size=%d.",
+                    batch_start, batch_size, new_size,
+                )
+                try:
+                    import torch
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                except Exception:
+                    pass
+                batch_size = new_size
+            else:
+                raise
+    raise RuntimeError(
+        f"Embedding failed for batch starting at index {batch_start}: exhausted all batch sizes"
+    )
+
+
 def embed_chunks(chunks: list[Chunk]) -> list[list[float]]:
     """
     Generates embeddings for all chunks using nomic-embed-text-v1.5.
@@ -561,34 +728,30 @@ def embed_chunks(chunks: list[Chunk]) -> list[list[float]]:
     model's asymmetric retrieval design. Processing is fully local — no API
     calls, no rate limits, no cost.
 
+    On Apple Silicon (MPS) the batch size is automatically reduced on OOM,
+    halving until batch_size=1 so every chunk is eventually embedded.
+
     Returns embedding vectors in the same order as the input chunks.
     """
-    model = _get_embedding_model()
+    model      = _get_embedding_model()
     embeddings: list[list[float]] = []
-
-    for batch_start in range(0, len(chunks), EMBED_BATCH_SIZE):
-        batch = chunks[batch_start : batch_start + EMBED_BATCH_SIZE]
-        # Prepend the document task prefix required by nomic-embed-text-v1.5
-        texts = [EMBED_DOC_PREFIX + c.to_chroma_document() for c in batch]
-
-        try:
-            vecs = model.encode(
-                texts,
-                batch_size       = EMBED_BATCH_SIZE,
-                show_progress_bar= False,
-                normalize_embeddings = True,   # cosine similarity needs unit vectors
-            )
-            embeddings.extend(vecs.tolist())
-            logger.debug(
-                "Embedded batch %d-%d (%d chunks).",
-                batch_start, batch_start + len(batch) - 1, len(batch),
-            )
-        except Exception as exc:
-            # sentence-transformers runs locally so transient errors are rare;
-            # re-raise immediately rather than retrying on a corrupted model state
-            raise RuntimeError(
-                f"Embedding failed for batch starting at index {batch_start}: {exc}"
-            ) from exc
+    batch_size = _initial_embed_batch_size()
+    with tqdm(total=len(chunks), desc="Embedding chunks", unit="chunk", dynamic_ncols=True) as pbar:
+        for batch_start in range(0, len(chunks), batch_size):
+            batch = chunks[batch_start : batch_start + batch_size]
+            texts = [EMBED_DOC_PREFIX + c.to_chroma_document() for c in batch]
+            try:
+                vecs = _embed_batch(model, texts, batch_size, batch_start)
+                embeddings.extend(vecs)
+                pbar.update(len(batch))
+                logger.debug(
+                    "Embedded batch %d-%d (%d chunks).",
+                    batch_start, batch_start + len(batch) - 1, len(batch),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Embedding failed for batch starting at index {batch_start}: {exc}"
+                ) from exc
 
     return embeddings
 
@@ -623,7 +786,8 @@ class VectorIndex:
     def __init__(
         self,
         persist_directory: str,
-        anthropic_client: anthropic.Anthropic,
+        llm_client: OpenAI,
+        llm_model: str,
         collection_name: str = CHROMA_COLLECTION,
     ):
         self._chroma     = chromadb.PersistentClient(path=persist_directory)
@@ -631,7 +795,8 @@ class VectorIndex:
             name     = collection_name,
             metadata = {"hnsw:space": "cosine"},
         )
-        self._anthropic = anthropic_client
+        self._llm = llm_client
+        self._llm_model = llm_model
         # Trigger model load at construction time so the first search isn't slow
         _get_embedding_model()
 
@@ -804,7 +969,12 @@ class VectorIndex:
         """Chunks all files then enriches all resulting chunks with cluster tags."""
         all_chunks: list[Chunk] = []
 
-        for file_path, raw_content in adoc_files.items():
+        for file_path, raw_content in progress_bar(
+            adoc_files.items(),
+            total=len(adoc_files),
+            desc="Chunking files",
+            unit="file",
+        ):
             file_chunks = chunk_adoc_file(raw_content, file_path)
             logger.debug("  %s -> %d chunk(s)", file_path, len(file_chunks))
             all_chunks.extend(file_chunks)
@@ -813,7 +983,7 @@ class VectorIndex:
             return []
 
         logger.info("Extracting cluster tags for %d chunks...", len(all_chunks))
-        extract_cluster_tags(all_chunks, self._anthropic)
+        extract_cluster_tags(all_chunks, self._llm, self._llm_model)
         return all_chunks
 
     def _embed_and_store(self, chunks: list[Chunk]) -> None:
@@ -845,19 +1015,28 @@ class VectorIndex:
 # Convenience factory
 # ---------------------------------------------------------------------------
 
-def build_index_from_env(persist_directory: str) -> VectorIndex:
+def build_index_from_env(
+    persist_directory: str,
+    config_path: str = "workflow_config.yaml",
+    openrouter_api_key: Optional[str] = None,
+) -> VectorIndex:
     """
     Builds a VectorIndex using credentials from environment variables.
 
     Embeddings are generated locally via sentence-transformers — no API key needed.
 
-    Required env var:
-        ANTHROPIC_API_KEY   (for cluster tag extraction via Claude Haiku)
+    The configured model is resolved from workflow_config.yaml unless
+    GAP_LLM_MODEL overrides it at runtime.
     """
-    import os
+    llm_model = load_llm_model_from_config(config_path)
     return VectorIndex(
         persist_directory = persist_directory,
-        anthropic_client  = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]),
+        llm_client        = OpenAI(
+            api_key     = resolve_openrouter_api_key(openrouter_api_key),
+            base_url    = "https://openrouter.ai/api/v1",
+            max_retries = 0,
+        ),
+        llm_model         = llm_model,
     )
 
 
@@ -894,6 +1073,16 @@ Examples:
         default=os.environ.get("CHROMA_PERSIST_DIR", "./chroma_db"),
         help="ChromaDB persistence directory.",
     )
+    parser.add_argument(
+        "--config",
+        default="workflow_config.yaml",
+        help="Workflow config path used to resolve the single LLM model.",
+    )
+    parser.add_argument(
+        "--openrouter-api-key",
+        default=None,
+        help="OpenRouter API key. If omitted, OPENROUTER_API_KEY is used.",
+    )
     parser.add_argument("--file-ext", default=".adoc")
     parser.add_argument(
         "--files", nargs="*", default=None,
@@ -906,18 +1095,27 @@ Examples:
     args = parser.parse_args()
 
     docs_root = Path(args.docs_repo_path)
+    if not docs_root.exists():
+        raise SystemExit(f"Docs repo path does not exist: {docs_root}")
+    if not docs_root.is_dir():
+        raise SystemExit(f"Docs repo path is not a directory: {docs_root}")
 
     # --inspect: chunk a file and print results, no index writes
     if args.inspect:
         inspect_path = docs_root / args.inspect
+        if not inspect_path.exists():
+            raise SystemExit(f"Inspect target does not exist: {inspect_path}")
+        if not inspect_path.is_file():
+            raise SystemExit(f"Inspect target is not a file: {inspect_path}")
         raw          = inspect_path.read_text(encoding="utf-8")
         file_type    = detect_file_type(raw)
+        chunk_level  = chunk_level_for(file_type, raw)
         chunks       = chunk_adoc_file(raw, args.inspect)
         enc          = tiktoken.get_encoding("cl100k_base")
 
         print(f"\nFile:             {args.inspect}")
         print(f"File type:        {file_type.value}")
-        print(f"Chunk level:      {chunk_level_for(file_type)} ({'=' * chunk_level_for(file_type)})")
+        print(f"Chunk level:      {chunk_level} ({'=' * chunk_level})")
         print(f"Total chunks:     {len(chunks)}\n")
         for c in chunks:
             tokens = _count_tokens(c.raw_text, enc)
@@ -927,7 +1125,11 @@ Examples:
             print(f"           tc_id:    {c.tc_id}   pics_code: {c.pics_code}\n")
         raise SystemExit(0)
 
-    index = build_index_from_env(args.persist_dir)
+    index = build_index_from_env(
+        args.persist_dir,
+        config_path=args.config,
+        openrouter_api_key=args.openrouter_api_key,
+    )
 
     if args.files:
         changed: dict[str, str] = {}
@@ -945,6 +1147,12 @@ Examples:
             for p in docs_root.rglob(f"*{args.file_ext}")
         }
         logger.info("Found %d %s files under %s.", len(adoc_files), args.file_ext, docs_root)
+        if not adoc_files:
+            logger.warning(
+                "No %s files found under %s. Check the repo path or starting subdirectory.",
+                args.file_ext,
+                docs_root,
+            )
         index.build_full_index(adoc_files)
 
     logger.info("Index now contains %d total chunks.", index.count())
