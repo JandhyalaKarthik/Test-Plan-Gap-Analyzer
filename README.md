@@ -1,4 +1,4 @@
-# Matter Test Plan Gap Analyzer
+# Test Plan Gap Analyzer
 
 Automatically analyses spec PRs and identifies which test cases in the test case repository need to be created or updated. Produces a structured Markdown report, posts a summary comment on each spec PR, and shows progress bars during long-running phases.
 
@@ -19,12 +19,6 @@ No test case files are modified. The system is purely analytical.
 
 ---
 
-### Disclaimer
-
-This was developed by using both Claude Chat and OpenAI's Codex for the majority of the application. OpenRouter was used for easy switching for the user between more kinds fo models and also becuase I needed a free model to run the main model to see if it works. I mostly provided the general scope, endpoints, and rough workflow of the project. I focused on general architecture, ensuring that for an MVP, it primarily was flexible for model usage and also was lightweight enough that additional parts could be substituted in if needed (for a better output), like a reranker algorithm. Claude and Codex wrote most of the code, while I focused on ensuring guardrails were implemented and that there weren't any issues with space or general end user experience.
-
----
-
 ### Model flow, briefly
 
 - One LLM only: `llm.model` in `workflow_config.yaml` is the single model used for decomposition, gap reasoning, self-review, and vector tag extraction.
@@ -42,7 +36,7 @@ This was developed by using both Claude Chat and OpenAI's Codex for the majority
 - The reasoner usually looks at only the top retrieved candidate. If the best hit is slightly wrong, the final recommendation can still be wrong. See gap_analyzer.py (line 1340).
 - Chunking is good, but still coarse. A full TC is usually one chunk, which preserves context, but it can hide exactly which sub-step or expected result is relevant. See vector_index.py (line 400).
 - Tag extraction is LLM-based and optional. If rate-limited, tags drop out and retrieval quality can degrade. See vector_index.py (line 543).
-- It is still very Matter/AsciiDoc-shaped. The parser and heuristics assume things like :picsCode:, AsciiDoc headers, and Matter-style test plans. See vector_index.py (line 204).
+- It is still very AsciiDoc-shaped. The parser and heuristics assume things like :picsCode: and AsciiDoc headers. See vector_index.py (line 204).
 - There is no learning loop. The tool does not improve from accepted/rejected recommendations over time.
 - There is no formal evaluation harness, so “good” vs “bad” retrieval and reasoning is still mostly judged manually.
 
@@ -80,17 +74,17 @@ index/
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/JandhyalaKarthik/matter-gap-analyzer
-cd matter-gap-analyzer
+git clone https://github.com/JandhyalaKarthik/spec-doc-LLM-analyzer/
+cd spec-doc-LLM-analyzer/
 ```
 
 ### 2. Decide how you'll point at the test case repo
 
 You can pass either:
 
-- A local path, such as `./matter-test-cases`
-- An `owner/repo` string, such as `your-org/matter-test-cases`
-- A GitHub URL, such as `https://github.com/your-org/matter-test-cases`
+- A local path, such as `./test-cases`
+- An `owner/repo` string, such as `your-org/test-cases`
+- A GitHub URL, such as `https://github.com/your-org/test-cases`
 
 For remote repos, `gap_analyzer.py` clones the requested branch automatically. Private repos work as long as the configured token has access. If your `.adoc` files live below the repo root, pass `--docs-subdir path/inside/repo`.
 
@@ -131,7 +125,7 @@ export SPEC_GITHUB_TOKEN="ghp_spec_..."     # Read spec repo PRs + post PR comme
 export DOCS_GITHUB_TOKEN="ghp_docs_..."     # Clone/pull/push the private test case repo
 # optional single-token fallback if one token can access both:
 export GITHUB_TOKEN="ghp_shared_..."
-export DOCS_REPO="https://github.com/your-org/matter-test-cases"
+export DOCS_REPO="https://github.com/your-org/test-cases"
 export DOCS_REPO_BRANCH="main"              # optional
 export DOCS_REPO_SUBDIR="."                 # optional
 export CHROMA_PERSIST_DIR="./chroma_db"
@@ -143,8 +137,8 @@ Or pass the OpenRouter key directly on the command line:
 ```bash
 python gap_analyzer.py \
   --pr 12681 \
-  --spec-repo your-org/matter-test-spec \
-  --docs-repo https://github.com/your-org/matter-test-cases \
+  --spec-repo your-org/test-spec \
+  --docs-repo https://github.com/your-org/test-cases \
   --openrouter-api-key "sk-or-v1-..."
 ```
 
@@ -179,7 +173,7 @@ python gap_analyzer.py \
 `gap_analyzer.py` now builds or incrementally updates the correct vector index automatically for the selected docs repo, branch, and subfolder. You only need `vector_index.py` if you want to inspect chunking or prebuild from a local checkout.
 
 ```bash
-python vector_index.py ./matter-test-cases --openrouter-api-key "sk-or-v1-..."
+python vector_index.py ./test-cases --openrouter-api-key "sk-or-v1-..."
 ```
 
 Takes 2–10 minutes depending on how many test case files exist. Slow phases now show `tqdm` progress bars, and subsequent runs use the cached index.
@@ -193,8 +187,8 @@ Takes 2–10 minutes depending on how many test case files exist. Slow phases no
 ```bash
 python gap_analyzer.py \
   --pr 12681 \
-  --spec-repo your-org/matter-test-spec \
-  --docs-repo https://github.com/your-org/matter-test-cases \
+  --spec-repo your-org/test-spec \
+  --docs-repo https://github.com/your-org/test-cases \
   --openrouter-api-key "sk-or-v1-..."
 ```
 
@@ -203,8 +197,8 @@ python gap_analyzer.py \
 ```bash
 python gap_analyzer.py \
   --pr 12681 \
-  --spec-repo https://github.com/your-org/matter-test-spec \
-  --docs-repo https://github.com/your-org/matter-test-cases \
+  --spec-repo https://github.com/your-org/test-spec \
+  --docs-repo https://github.com/your-org/test-cases \
   --docs-subdir src/tests
 ```
 
@@ -213,8 +207,8 @@ python gap_analyzer.py \
 ```bash
 python gap_analyzer.py \
   --prs 12681 12657 12615 12523 \
-  --spec-repo your-org/matter-test-spec \
-  --docs-repo your-org/matter-test-cases
+  --spec-repo your-org/test-spec \
+  --docs-repo your-org/test-cases
 ```
 
 ### Dry run with explicit branches and a subfolder
@@ -222,9 +216,9 @@ python gap_analyzer.py \
 ```bash
 python gap_analyzer.py \
   --prs 12681 12657 \
-  --spec-repo https://github.com/your-org/matter-test-spec \
+  --spec-repo https://github.com/your-org/test-spec \
   --spec-branch release/1.6 \
-  --docs-repo https://github.com/your-org/matter-test-cases \
+  --docs-repo https://github.com/your-org/test-cases \
   --docs-branch release/1.6 \
   --docs-subdir src/tests \
   --dry-run
@@ -258,7 +252,7 @@ Saved as `GAP_REPORT_PR_{numbers}_{date}.md` locally (always) and committed to t
 Structure:
 
 ```
-# Matter / CHIP Spec — Test Plan Gap Analysis
+# Spec — Test Plan Gap Analysis
 
 | N Spec Changes | N Clusters Need New TCs | N Clusters Need TC Updates | N Needs Review |
 |---|---|---|---|
@@ -301,7 +295,7 @@ Configure these in the repo's Settings → Secrets and variables:
 | `DOCS_GITHUB_TOKEN` | Secret | Optional PAT/App token for private docs repo clone/push access |
 | `GITHUB_TOKEN` | Automatic | Shared fallback if one token can access both repos |
 | `GAP_LLM_MODEL` | Variable | Optional workflow-level override for the single LLM model used everywhere |
-| `DOCS_REPO_NAME` | Variable | Optional default docs repo, e.g. `your-org/matter-test-cases` |
+| `DOCS_REPO_NAME` | Variable | Optional default docs repo, e.g. `your-org/test-cases` |
 | `DOCS_REPO_BRANCH` | Variable | Optional default docs branch, e.g. `main` |
 | `DOCS_REPO_SUBDIR` | Variable | Optional default docs subfolder, e.g. `src/tests` |
 | `SPEC_REPO_NAME` | Variable | Optional default spec repo for manual dispatch |
@@ -323,7 +317,7 @@ If one token can access both, you can keep using only `GITHUB_TOKEN`.
 
 **Test cases changed** — run incremental update on just the changed files:
 ```bash
-python vector_index.py ./matter-test-cases \
+python vector_index.py ./test-cases \
   --files clusters/on_off/on_off.adoc clusters/fabric_sync/fabric_synchronization.adoc
 ```
 
@@ -333,12 +327,12 @@ python vector_index.py ./matter-test-cases \
 
 **Full rebuild** (if things seem off):
 ```bash
-python vector_index.py ./matter-test-cases
+python vector_index.py ./test-cases
 ```
 
 **Inspect how a file was chunked** (useful for debugging retrieval):
 ```bash
-python vector_index.py ./matter-test-cases --inspect fabric_synchronization.adoc
+python vector_index.py ./test-cases --inspect fabric_synchronization.adoc
 ```
 
 ---
@@ -427,7 +421,7 @@ Why this works:
 **"No chunks produced" during indexing**  
 The test case files may use a non-standard structure. Run `--inspect` on a specific file to see how it's being chunked:
 ```bash
-python vector_index.py ./matter-test-cases --inspect clusters/on_off/on_off.adoc
+python vector_index.py ./test-cases --inspect clusters/on_off/on_off.adoc
 ```
 Check that the file has `:picsCode:` defined and uses `====` level headers for individual test cases.
 
