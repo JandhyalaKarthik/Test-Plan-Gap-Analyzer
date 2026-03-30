@@ -17,6 +17,14 @@ For each input PR, the single OpenRouter model configured in `workflow_config.ya
 
 No test case files are modified. The system is purely analytical.
 
+---
+
+### Disclaimer
+
+This was developed by using both Claude Chat and OpenAI's Codex for the majority of the application. OpenRouter was used for easy switching for the user between more kinds fo models and also becuase I needed a free model to run the main model to see if it works. I mostly provided the general scope, endpoints, and rough workflow of the project. I focused on general architecture, ensuring that for an MVP, it primarily was flexible for model usage and also was lightweight enough that additional parts could be substituted in if needed (for a better output), like a reranker algorithm. Claude and Codex wrote most of the code, while I focused on ensuring guardrails were implemented and that there weren't any issues with space or general end user experience.
+
+---
+
 ### Model flow, briefly
 
 - One LLM only: `llm.model` in `workflow_config.yaml` is the single model used for decomposition, gap reasoning, self-review, and vector tag extraction.
@@ -24,6 +32,31 @@ No test case files are modified. The system is purely analytical.
 - Test case retrieval is hybrid: keyword grep plus vector search over locally generated embeddings in ChromaDB. The embeddings are local and do not call an LLM.
 - After retrieval, the same configured model decides whether the PR implies updating an existing test case, creating new coverage, or marking the result for manual review.
 - If the LLM is rate-limited, the tool falls back to heuristics so the run can still finish with a conservative recommendation.
+
+---
+
+### Limitations
+
+- It only understands the spec side from PR metadata and patch text, not the full spec corpus. The fetch step pulls title, body, commit messages, and diff, then truncates long diffs, so broader context can be missed. See gap_analyzer.py (line 631).
+- Retrieval is fairly shallow. It does keyword grep first, then vector search, but there is no reranker and no cross-check across multiple candidates before reasoning. See gap_analyzer.py (line 1161).
+- The reasoner usually looks at only the top retrieved candidate. If the best hit is slightly wrong, the final recommendation can still be wrong. See gap_analyzer.py (line 1340).
+- Chunking is good, but still coarse. A full TC is usually one chunk, which preserves context, but it can hide exactly which sub-step or expected result is relevant. See vector_index.py (line 400).
+- Tag extraction is LLM-based and optional. If rate-limited, tags drop out and retrieval quality can degrade. See vector_index.py (line 543).
+- It is still very Matter/AsciiDoc-shaped. The parser and heuristics assume things like :picsCode:, AsciiDoc headers, and Matter-style test plans. See vector_index.py (line 204).
+- There is no learning loop. The tool does not improve from accepted/rejected recommendations over time.
+- There is no formal evaluation harness, so “good” vs “bad” retrieval and reasoning is still mostly judged manually.
+
+---
+
+### Areas of Improvement
+
+- Add parent-child chunking. Keep one chunk for the whole TC, but also index smaller child chunks for Purpose, Preconditions, Test Procedure, and expected results.
+- Add reranking. Retrieve top N candidates, then use either a lightweight reranker or the LLM to compare them before final reasoning.
+- Use broader spec context. Read the changed spec section plus neighboring sections, not just the PR patch text.
+- Aggregate evidence from multiple candidates. For some PRs, coverage lives across several test cases, not one.
+- Add a small labeled benchmark set: PR -> expected test plan outcome. That would let you tune threshold, chunking, and prompts with real feedback.
+- Cache LLM outputs by PR hash and chunk hash. That would reduce cost, rate-limit pain, and run-to-run drift.
+- Make output more structured for authors: suggested target file, target section, suggested sub-TC title, and rationale confidence.
 
 ---
 
