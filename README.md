@@ -460,3 +460,22 @@ That restores:
 - `workflow_config.yaml`
 - `gap_analysis.yml`
 - `README.md`
+
+### Areas of Improvement
+
+**Retrieval & AI Pipeline**
+- Add parent-child chunking. Keep one chunk for the whole TC, but also index smaller child chunks for Purpose, Preconditions, Test Procedure, and expected results.
+- Add reranking. Retrieve top N candidates, then use either a lightweight reranker or the LLM to compare them before final reasoning.
+- Use broader spec context. Read the changed spec section plus neighboring sections, not just the PR patch text.
+- Aggregate evidence from multiple candidates. For some PRs, coverage lives across several test cases, not one.
+- Add a small labeled benchmark set: PR -> expected test plan outcome. That would let you tune threshold, chunking, and prompts with real feedback.
+- Cache LLM outputs by PR hash and chunk hash. That would reduce cost, rate-limit pain, and run-to-run drift.
+- Make output more structured for authors: suggested target file, target section, suggested sub-TC title, and rationale confidence.
+
+**Software Engineering & Architecture**
+- **Refactor Monolithic Orchestrator:** Split `gap_analyzer.py` into discrete modular files (e.g., `github_client.py`, `llm_agents.py`, `report_renderer.py`) for better maintainability.
+- **Automated Testing Suite:** Implement a `pytest` suite focusing on the custom AsciiDoc AST chunker, attribute resolution, and heuristic fallback logic to ensure stability.
+- **Robust LLM Parsing:** Upgrade from regex-based JSON stripping to structured outputs using `Pydantic` and libraries like `Instructor`, or native JSON-mode API parameters.
+- **Strict Type Hinting:** Convert loose dictionaries (like the header map output) into `dataclass` or `TypedDict` structures for complete `mypy` coverage across the codebase.
+- **Explicit Failure Handling:** Address silent "soft failures" in vector tag extraction to prevent unnoticed search degradation when LLM rate limits are hit.
+- **Least Privilege CI/CD:** Explicitly define `permissions:` blocks in GitHub Actions workflows to limit default `GITHUB_TOKEN` access.
