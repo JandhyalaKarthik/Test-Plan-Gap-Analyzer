@@ -4,6 +4,43 @@ Automatically analyses spec PRs and identifies which test cases in the test case
 
 ---
 
+## Table of Contents
+
+- [How it works](#how-it-works)
+  - [Model flow, briefly](#model-flow-briefly)
+  - [Limitations](#limitations)
+  - [Areas of Improvement](#areas-of-improvement)
+- [Repository layout](#repository-layout)
+- [Setup](#setup)
+  - [1. Clone this repo](#1-clone-this-repo)
+  - [2. Decide how you'll point at the test case repo](#2-decide-how-youll-point-at-the-test-case-repo)
+  - [2a. Input mapping](#2a-input-mapping)
+  - [3. Install dependencies](#3-install-dependencies)
+  - [4. Set environment variables](#4-set-environment-variables)
+  - [4a. Private repo credentials](#4a-private-repo-credentials)
+  - [5. Optional: prebuild or inspect the vector index](#5-optional-prebuild-or-inspect-the-vector-index)
+- [Running](#running)
+  - [Analyse a single PR](#analyse-a-single-pr)
+  - [Analyse a single PR with both repo locations spelled out](#analyse-a-single-pr-with-both-repo-locations-spelled-out)
+  - [Analyse multiple PRs (one combined report)](#analyse-multiple-prs-one-combined-report)
+  - [Dry run with explicit branches and a subfolder](#dry-run-with-explicit-branches-and-a-subfolder)
+  - [Options](#options)
+- [Output](#output)
+  - [Full Markdown report](#full-markdown-report)
+  - [GitHub PR comment](#github-pr-comment)
+- [GitHub Actions](#github-actions)
+  - [Required GitHub secrets and variables](#required-github-secrets-and-variables)
+- [Updating the index](#updating-the-index)
+- [Configuration](#configuration)
+- [Interpreting the report](#interpreting-the-report)
+  - [Priority levels](#priority-levels)
+  - [Action types](#action-types)
+  - [⚠️ Verify flag](#️-verify-flag)
+- [Troubleshooting](#troubleshooting)
+- [Reverting Changes](#reverting-changes)
+
+---
+
 ## How it works
 
 The system operates across two completely separate repositories:
@@ -44,6 +81,7 @@ No test case files are modified. The system is purely analytical.
 
 ### Areas of Improvement
 
+**Retrieval & AI Pipeline**
 - Add parent-child chunking. Keep one chunk for the whole TC, but also index smaller child chunks for Purpose, Preconditions, Test Procedure, and expected results.
 - Add reranking. Retrieve top N candidates, then use either a lightweight reranker or the LLM to compare them before final reasoning.
 - Use broader spec context. Read the changed spec section plus neighboring sections, not just the PR patch text.
@@ -51,6 +89,14 @@ No test case files are modified. The system is purely analytical.
 - Add a small labeled benchmark set: PR -> expected test plan outcome. That would let you tune threshold, chunking, and prompts with real feedback.
 - Cache LLM outputs by PR hash and chunk hash. That would reduce cost, rate-limit pain, and run-to-run drift.
 - Make output more structured for authors: suggested target file, target section, suggested sub-TC title, and rationale confidence.
+
+**Software Engineering & Architecture**
+- **Refactor Monolithic Orchestrator:** Split `gap_analyzer.py` into discrete modular files (e.g., `github_client.py`, `llm_agents.py`, `report_renderer.py`) for better maintainability.
+- **Automated Testing Suite:** Implement a `pytest` suite focusing on the custom AsciiDoc AST chunker, attribute resolution, and heuristic fallback logic to ensure stability.
+- **Robust LLM Parsing:** Upgrade from regex-based JSON stripping to structured outputs using `Pydantic` and libraries like `Instructor`, or native JSON-mode API parameters.
+- **Strict Type Hinting:** Convert loose dictionaries (like the header map output) into `dataclass` or `TypedDict` structures for complete `mypy` coverage across the codebase.
+- **Explicit Failure Handling:** Address silent "soft failures" in vector tag extraction to prevent unnoticed search degradation when LLM rate limits are hit.
+- **Least Privilege CI/CD:** Explicitly define `permissions:` blocks in GitHub Actions workflows to limit default `GITHUB_TOKEN` access.
 
 ---
 
@@ -197,7 +243,7 @@ python gap_analyzer.py \
 ```bash
 python gap_analyzer.py \
   --pr 12681 \
-  --spec-repo https://github.com/your-org/test-spec \
+  --spec-repo your-org/test-spec \
   --docs-repo https://github.com/your-org/test-cases \
   --docs-subdir src/tests
 ```
@@ -460,22 +506,3 @@ That restores:
 - `workflow_config.yaml`
 - `gap_analysis.yml`
 - `README.md`
-
-### Areas of Improvement
-
-**Retrieval & AI Pipeline**
-- Add parent-child chunking. Keep one chunk for the whole TC, but also index smaller child chunks for Purpose, Preconditions, Test Procedure, and expected results.
-- Add reranking. Retrieve top N candidates, then use either a lightweight reranker or the LLM to compare them before final reasoning.
-- Use broader spec context. Read the changed spec section plus neighboring sections, not just the PR patch text.
-- Aggregate evidence from multiple candidates. For some PRs, coverage lives across several test cases, not one.
-- Add a small labeled benchmark set: PR -> expected test plan outcome. That would let you tune threshold, chunking, and prompts with real feedback.
-- Cache LLM outputs by PR hash and chunk hash. That would reduce cost, rate-limit pain, and run-to-run drift.
-- Make output more structured for authors: suggested target file, target section, suggested sub-TC title, and rationale confidence.
-
-**Software Engineering & Architecture**
-- **Refactor Monolithic Orchestrator:** Split `gap_analyzer.py` into discrete modular files (e.g., `github_client.py`, `llm_agents.py`, `report_renderer.py`) for better maintainability.
-- **Automated Testing Suite:** Implement a `pytest` suite focusing on the custom AsciiDoc AST chunker, attribute resolution, and heuristic fallback logic to ensure stability.
-- **Robust LLM Parsing:** Upgrade from regex-based JSON stripping to structured outputs using `Pydantic` and libraries like `Instructor`, or native JSON-mode API parameters.
-- **Strict Type Hinting:** Convert loose dictionaries (like the header map output) into `dataclass` or `TypedDict` structures for complete `mypy` coverage across the codebase.
-- **Explicit Failure Handling:** Address silent "soft failures" in vector tag extraction to prevent unnoticed search degradation when LLM rate limits are hit.
-- **Least Privilege CI/CD:** Explicitly define `permissions:` blocks in GitHub Actions workflows to limit default `GITHUB_TOKEN` access.
