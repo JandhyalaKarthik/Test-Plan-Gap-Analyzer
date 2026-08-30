@@ -46,6 +46,12 @@ on:
 
 jobs:
   gap-analysis:
+    # Explicitly restrict the default GITHUB_TOKEN permissions
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      
     # For push-triggered runs, only proceed if the PR was actually merged
     if: >
       github.event_name == 'workflow_dispatch' ||
